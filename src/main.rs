@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    AnyView, App, AppContext as _, Bounds, Context, Decorations, MouseButton, MouseDownEvent,
-    MouseMoveEvent, Pixels, ScrollHandle, SharedString, Size, TitlebarOptions, Window,
-    WindowBounds, WindowOptions, div, point, prelude::*, px, relative, rgb, size, uniform_list,
+    div, point, prelude::*, px, relative, rgb, size, uniform_list, AnyView, App, AppContext as _,
+    Bounds, Context, Decorations, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels,
+    ScrollHandle, SharedString, Size, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 use pricing::{PriceSource, PriceTable, Usage};
@@ -210,9 +210,9 @@ impl Stats {
                     .iter()
                     .filter(|t| t.model == Some(ix as u16))
                     .collect();
-                let cost = prices.lookup(model).map(|price| {
-                    turns.iter().map(|t| price.cost_usd(&t.usage())).sum()
-                });
+                let cost = prices
+                    .lookup(model)
+                    .map(|price| turns.iter().map(|t| price.cost_usd(&t.usage())).sum());
                 ModelMixRow {
                     model: model.clone(),
                     turns: turns.len(),
@@ -321,9 +321,8 @@ impl SessionTail {
         match entry_type {
             "assistant" => {
                 let message = obj.get("message");
-                let get = |usage: &Value, key: &str| {
-                    usage.get(key).and_then(Value::as_u64).unwrap_or(0)
-                };
+                let get =
+                    |usage: &Value, key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
                 if let Some(usage) = message.and_then(|m| m.get("usage")) {
                     let model = message
                         .and_then(|m| m.get("model"))
@@ -625,7 +624,12 @@ fn stat_tile(label: &str, value: String, swatch: Option<u32>) -> impl IntoElemen
     if let Some(color) = swatch {
         label_row = label_row.child(div().size(px(8.0)).rounded_sm().bg(rgb(color)));
     }
-    label_row = label_row.child(div().text_xs().text_color(rgb(MUTED)).child(label.to_string()));
+    label_row = label_row.child(
+        div()
+            .text_xs()
+            .text_color(rgb(MUTED))
+            .child(label.to_string()),
+    );
 
     div()
         .flex()
@@ -868,7 +872,11 @@ fn model_panel(stats: &Stats, prices: &PriceTable) -> impl IntoElement {
     };
     let model = stats.model_of(current).unwrap_or_default();
     let price = prices.lookup(model);
-    let display = |id: &str| prices.lookup(id).map_or_else(|| id.to_string(), |p| p.name.clone());
+    let display = |id: &str| {
+        prices
+            .lookup(id)
+            .map_or_else(|| id.to_string(), |p| p.name.clone())
+    };
 
     let mut panel = div().flex().flex_col().gap_3().child(
         div()
@@ -914,7 +922,10 @@ fn model_panel(stats: &Stats, prices: &PriceTable) -> impl IntoElement {
                         .child(div().h_full().w(relative(frac)).bg(rgb(color)).rounded_sm()),
                 )
         }
-        None => div().child(muted(format!("Context {} (window unknown)", format_tokens(used)))),
+        None => div().child(muted(format!(
+            "Context {} (window unknown)",
+            format_tokens(used)
+        ))),
     };
     panel = panel.child(context);
 
@@ -950,7 +961,11 @@ fn model_panel(stats: &Stats, prices: &PriceTable) -> impl IntoElement {
 
     let mix = stats.model_mix(prices);
     if mix.len() > 1 {
-        let mut rows = div().flex().flex_col().gap_1().child(muted("Model mix".to_string()));
+        let mut rows = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(muted("Model mix".to_string()));
         for row in mix {
             rows = rows.child(
                 div()
@@ -958,8 +973,17 @@ fn model_panel(stats: &Stats, prices: &PriceTable) -> impl IntoElement {
                     .flex_row()
                     .gap_2()
                     .text_xs()
-                    .child(div().flex_1().text_color(rgb(INK_2)).child(display(&row.model)))
-                    .child(div().text_color(rgb(MUTED)).child(format!("{} turns", row.turns)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(rgb(INK_2))
+                            .child(display(&row.model)),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(MUTED))
+                            .child(format!("{} turns", row.turns)),
+                    )
                     .child(
                         div()
                             .w(px(64.0))
@@ -1057,8 +1081,16 @@ impl Render for SessionMonitor {
         let start = n_turns.saturating_sub(CHART_TURNS);
         let window_turns = &stats.turns[start..];
         let x_labels = (
-            if n_turns == 0 { String::new() } else { format!("turn {}", start + 1) },
-            if n_turns == 0 { String::new() } else { format!("turn {n_turns}") },
+            if n_turns == 0 {
+                String::new()
+            } else {
+                format!("turn {}", start + 1)
+            },
+            if n_turns == 0 {
+                String::new()
+            } else {
+                format!("turn {n_turns}")
+            },
         );
 
         // Chart A: prompt composition per turn (stacked).
@@ -1263,7 +1295,8 @@ impl Render for SessionMonitor {
                                             .filter_map(|e| e.latency_ms)
                                             .max()
                                             .unwrap_or(1)
-                                            .max(1) as f32;
+                                            .max(1)
+                                            as f32;
                                         let mut rows = Vec::new();
                                         for ix in range {
                                             let Some(entry) = entries.get(ix) else {
@@ -1469,23 +1502,24 @@ fn title_bar(window: &Window) -> Option<impl IntoElement> {
             .on_mouse_down(MouseButton::Right, |event, window, _| {
                 window.show_window_menu(event.position);
             })
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(INK_2))
-                    .child(WINDOW_TITLE),
-            )
+            .child(div().text_xs().text_color(rgb(INK_2)).child(WINDOW_TITLE))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .h_full()
-                    .child(title_bar_button("minimize", "–", HOVER_WASH, |window, _| {
-                        window.minimize_window()
-                    }))
-                    .child(title_bar_button("maximize", maximize_glyph, HOVER_WASH, |window, _| {
-                        window.zoom_window()
-                    }))
+                    .child(title_bar_button(
+                        "minimize",
+                        "–",
+                        HOVER_WASH,
+                        |window, _| window.minimize_window(),
+                    ))
+                    .child(title_bar_button(
+                        "maximize",
+                        maximize_glyph,
+                        HOVER_WASH,
+                        |window, _| window.zoom_window(),
+                    ))
                     .child(title_bar_button("close", "×", CRITICAL, |window, _| {
                         window.remove_window()
                     })),
@@ -1524,7 +1558,9 @@ fn display_known_at_launch(cx: &App) -> bool {
 fn fit_window_to(visible: Size<Pixels>) -> Size<Pixels> {
     let fit = |avail: Pixels, preferred: f32, min: f32| {
         let avail = f32::from(avail);
-        px((avail * WINDOW_SCREEN_FRACTION).min(preferred).max(min.min(avail)))
+        px((avail * WINDOW_SCREEN_FRACTION)
+            .min(preferred)
+            .max(min.min(avail)))
     };
     size(
         fit(visible.width, WINDOW_PREFERRED.0, WINDOW_MIN.0),
@@ -1585,13 +1621,28 @@ mod tests {
         ] {
             stats.turns.push(t);
         }
-        assert_eq!(stats.models, ["claude-opus-5-5", "claude-sonnet-5-5", "mystery-model"]);
+        assert_eq!(
+            stats.models,
+            ["claude-opus-5-5", "claude-sonnet-5-5", "mystery-model"]
+        );
         assert!((stats.total_cost_usd(&prices) - 10.0).abs() < 1e-9);
         assert_eq!(stats.unpriced_turns(&prices), 1);
         let mix = stats.model_mix(&prices);
-        assert_eq!((mix[0].model.as_str(), mix[0].turns), ("claude-opus-5-5", 2));
+        assert_eq!(
+            (mix[0].model.as_str(), mix[0].turns),
+            ("claude-opus-5-5", 2)
+        );
         assert!((mix[0].cost.unwrap() - 8.0).abs() < 1e-9);
-        assert_eq!(mix.iter().find(|r| r.model == "mystery-model").unwrap().cost, None);
-        assert_eq!(stats.model_of(stats.current_turn().unwrap()), Some("mystery-model"));
+        assert_eq!(
+            mix.iter()
+                .find(|r| r.model == "mystery-model")
+                .unwrap()
+                .cost,
+            None
+        );
+        assert_eq!(
+            stats.model_of(stats.current_turn().unwrap()),
+            Some("mystery-model")
+        );
     }
 }
