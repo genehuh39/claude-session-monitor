@@ -6,7 +6,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{bail, Context as _, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -86,9 +86,33 @@ impl PriceTable {
             p("Claude Mythos 5.1", 10.0, 12.5, 20.0, 0.25, 50.0, None),
             p("Claude Fable 5", 10.0, 12.5, 20.0, 1.0, 50.0, None),
             p("Claude Mythos 5", 10.0, 12.5, 20.0, 1.0, 50.0, None),
-            p("Claude Opus 5.5", 4.0, 5.0, 8.0, 0.20, 20.0, Some((8.0, 40.0))),
-            p("Claude Opus 5", 5.0, 6.25, 10.0, 0.50, 25.0, Some((10.0, 50.0))),
-            p("Claude Opus 4.8", 5.0, 6.25, 10.0, 0.50, 25.0, Some((10.0, 50.0))),
+            p(
+                "Claude Opus 5.5",
+                4.0,
+                5.0,
+                8.0,
+                0.20,
+                20.0,
+                Some((8.0, 40.0)),
+            ),
+            p(
+                "Claude Opus 5",
+                5.0,
+                6.25,
+                10.0,
+                0.50,
+                25.0,
+                Some((10.0, 50.0)),
+            ),
+            p(
+                "Claude Opus 4.8",
+                5.0,
+                6.25,
+                10.0,
+                0.50,
+                25.0,
+                Some((10.0, 50.0)),
+            ),
             p("Claude Opus 4.7", 5.0, 6.25, 10.0, 0.50, 25.0, None),
             p("Claude Opus 4.6", 5.0, 6.25, 10.0, 0.50, 25.0, None),
             p("Claude Opus 4.5", 5.0, 6.25, 10.0, 0.50, 25.0, None),
@@ -136,7 +160,9 @@ impl PriceTable {
         let models = parse_pricing_page(&body)?;
         Ok(Self {
             models,
-            source: PriceSource::Live { fetched_at: Utc::now() },
+            source: PriceSource::Live {
+                fetched_at: Utc::now(),
+            },
         })
     }
 
@@ -235,7 +261,10 @@ fn find_table<'a>(
         .iter()
         .take_while(|l| l.trim_start().starts_with('|'))
         .map(|l| cells(l))
-        .filter(|row| !row.iter().all(|c| c.chars().all(|ch| matches!(ch, '-' | ':' | ' '))))
+        .filter(|row| {
+            !row.iter()
+                .all(|c| c.chars().all(|ch| matches!(ch, '-' | ':' | ' ')))
+        })
         .collect();
     Some((header, rows))
 }
@@ -267,7 +296,9 @@ pub fn parse_pricing_page(text: &str) -> Result<HashMap<String, ModelPrice>> {
         else {
             continue;
         };
-        let Some(name_cell) = row.get(c_model) else { continue };
+        let Some(name_cell) = row.get(c_model) else {
+            continue;
+        };
         models.insert(
             model_id_from_name(name_cell),
             ModelPrice {
@@ -287,7 +318,10 @@ pub fn parse_pricing_page(text: &str) -> Result<HashMap<String, ModelPrice>> {
 
     // Fast mode has its own table under its own heading; models absent from it bill at standard
     // rates even when a request asks for fast mode.
-    if let Some(start) = lines.iter().position(|l| l.trim_start().starts_with("### Fast mode")) {
+    if let Some(start) = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("### Fast mode"))
+    {
         if let Some((_, rows)) = find_table(&lines, start, &["Model", "Input", "Output"]) {
             for row in rows {
                 let (Some(name_cell), Some(fin), Some(fout)) = (
@@ -369,7 +403,10 @@ mod tests {
         assert_eq!(models.len(), 6);
         let opus = &models["claude-opus-5-5"];
         assert_eq!(opus.name, "Claude Opus 5.5");
-        assert_eq!((opus.input, opus.cache_write_1h, opus.cache_read), (4.0, 8.0, 0.20));
+        assert_eq!(
+            (opus.input, opus.cache_write_1h, opus.cache_read),
+            (4.0, 8.0, 0.20)
+        );
         assert_eq!(opus.fast, Some((8.0, 40.0)));
         assert_eq!(models["claude-opus-4-8"].fast, Some((10.0, 50.0)));
         assert_eq!(models["claude-mythos-5-1"].name, "Claude Mythos 5.1");
@@ -394,8 +431,14 @@ mod tests {
     #[test]
     fn lookup_handles_prefixes_and_snapshots() {
         let table = PriceTable::built_in();
-        assert_eq!(table.lookup("us.anthropic.claude-opus-5-5").unwrap().input, 4.0);
-        assert_eq!(table.lookup("claude-haiku-4-5-20251001").unwrap().input, 1.0);
+        assert_eq!(
+            table.lookup("us.anthropic.claude-opus-5-5").unwrap().input,
+            4.0
+        );
+        assert_eq!(
+            table.lookup("claude-haiku-4-5-20251001").unwrap().input,
+            1.0
+        );
         assert_eq!(table.lookup("claude-opus-5").unwrap().input, 5.0);
         assert_eq!(table.lookup("claude-sonnet-4-6[1m]").unwrap().input, 3.0);
         assert!(table.lookup("<synthetic>").is_none());
@@ -416,9 +459,15 @@ mod tests {
         };
         // 4 input + 20 output + 0.20 read + 5 (5m write) + 8 (1h write)
         assert!((opus.cost_usd(&usage) - 37.20).abs() < 1e-9);
-        let fast = Usage { fast: true, ..usage };
+        let fast = Usage {
+            fast: true,
+            ..usage
+        };
         assert!((opus.cost_usd(&fast) - 74.40).abs() < 1e-9);
-        let geo = Usage { us_geo: true, ..usage };
+        let geo = Usage {
+            us_geo: true,
+            ..usage
+        };
         assert!((opus.cost_usd(&geo) - 40.92).abs() < 1e-9);
         // Opus 4.6 has no fast-mode price: fast requests bill at standard rates.
         let opus46 = table.lookup("claude-opus-4-6").unwrap();
