@@ -58,6 +58,7 @@ pub fn list_sessions() -> Vec<SessionFile> {
             let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
                 continue;
             };
+            let modified = latest_subagent_write(&path).map_or(modified, |m| m.max(modified));
             sessions.push(SessionFile { path, modified });
         }
     }
@@ -65,8 +66,32 @@ pub fn list_sessions() -> Vec<SessionFile> {
     sessions
 }
 
-pub fn modified(path: &Path) -> Option<SystemTime> {
-    fs::metadata(path).and_then(|m| m.modified()).ok()
+/// When the session was last written to, counting its subagents: while a subagent runs, the
+/// main transcript can sit untouched for minutes.
+pub fn last_activity(path: &Path) -> Option<SystemTime> {
+    let main = fs::metadata(path).and_then(|m| m.modified()).ok();
+    match (main, latest_subagent_write(path)) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+fn latest_subagent_write(session: &Path) -> Option<SystemTime> {
+    subagent_files(session)
+        .iter()
+        .filter_map(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
+        .max()
+}
+
+fn subagent_files(session: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(subagent_dir(session)) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .collect()
 }
 
 pub fn is_live(modified: Option<SystemTime>) -> bool {
@@ -138,27 +163,23 @@ fn subagent_dir(session: &Path) -> PathBuf {
 /// Picks up subagent transcripts that appeared since the last call and reads new lines from all
 /// of them.
 pub fn sync_agents(session: &Path, agents: &mut Vec<AgentRun>) {
-    if let Ok(entries) = fs::read_dir(subagent_dir(session)) {
-        let mut found: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
-            .filter(|p| !agents.iter().any(|a| a.tail.path == *p))
-            .collect();
-        found.sort();
-        for path in found {
-            let id = path
-                .file_stem()
-                .map(|s| s.to_string_lossy().trim_start_matches("agent-").to_string())
-                .unwrap_or_default();
-            agents.push(AgentRun {
-                id,
-                agent_type: None,
-                description: None,
-                tail: SessionTail::new(path),
-                stats: Stats::default(),
-            });
-        }
+    let mut found: Vec<PathBuf> = subagent_files(session)
+        .into_iter()
+        .filter(|p| !agents.iter().any(|a| a.tail.path == *p))
+        .collect();
+    found.sort();
+    for path in found {
+        let id = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().trim_start_matches("agent-").to_string())
+            .unwrap_or_default();
+        agents.push(AgentRun {
+            id,
+            agent_type: None,
+            description: None,
+            tail: SessionTail::new(path),
+            stats: Stats::default(),
+        });
     }
     for agent in agents.iter_mut() {
         // The metadata file can land after the transcript starts.
@@ -172,19 +193,32 @@ pub fn sync_agents(session: &Path, agents: &mut Vec<AgentRun>) {
 /// A whole session, including its subagents, reduced to what the session picker shows.
 #[derive(Clone, Debug)]
 pub struct SessionSummary {
-    /// File length when summarized; a longer file means the summary is stale.
-    pub len: u64,
+    /// The transcripts' sizes when summarized; a different fingerprint means it's stale.
+    pub fingerprint: Fingerprint,
     pub cwd: Option<String>,
     pub cost: f64,
     pub partial: bool,
 }
 
-pub fn file_len(path: &Path) -> u64 {
-    fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+/// Total length and count of a session's transcripts, its subagents' included. Transcripts are
+/// append-only, so any new usage changes it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fingerprint {
+    bytes: u64,
+    files: usize,
+}
+
+pub fn fingerprint(path: &Path) -> Fingerprint {
+    let len = |p: &Path| fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let agents = subagent_files(path);
+    Fingerprint {
+        bytes: len(path) + agents.iter().map(|p| len(p)).sum::<u64>(),
+        files: 1 + agents.len(),
+    }
 }
 
 pub fn summarize(path: &Path, prices: &PriceTable) -> SessionSummary {
-    let len = file_len(path);
+    let fingerprint = fingerprint(path);
     let mut tail = SessionTail::new(path.to_path_buf());
     let mut stats = Stats::default();
     let _ = tail.poll(&mut stats);
@@ -197,7 +231,7 @@ pub fn summarize(path: &Path, prices: &PriceTable) -> SessionSummary {
         partial |= s.unpriced_turns(prices) > 0;
     }
     SessionSummary {
-        len,
+        fingerprint,
         cwd: stats.cwd,
         cost,
         partial,
@@ -229,6 +263,31 @@ mod tests {
         ));
         // A current session that vanished (no mtime) is abandoned.
         assert!(should_follow(Some(a), None, b, now));
+    }
+
+    #[test]
+    fn subagents_count_toward_activity_and_fingerprint() {
+        let dir = std::env::temp_dir().join(format!("csm-test-{}", std::process::id()));
+        let session = dir.join("abc.jsonl");
+        let agents = dir.join("abc/subagents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(&session, "main\n").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(600);
+        fs::File::options()
+            .write(true)
+            .open(&session)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let before = fingerprint(&session);
+
+        // A subagent writing while the main transcript sits idle keeps the session active.
+        fs::write(agents.join("agent-x.jsonl"), "agent\n").unwrap();
+        assert!(last_activity(&session).unwrap() > old + Duration::from_secs(300));
+        assert!(is_live(last_activity(&session)));
+        assert_ne!(fingerprint(&session), before);
+        assert_eq!(fingerprint(&session).files, 2);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
