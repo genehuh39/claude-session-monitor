@@ -42,12 +42,62 @@ const C_INPUT: u32 = 0x199e70;
 const C_OUTPUT: u32 = 0xc98500;
 const CRITICAL: u32 = 0xd03b3b;
 
+/// Claude API list prices in USD per million tokens (first-party API, standard tier).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Rates {
+    input: f64,
+    output: f64,
+    cache_read: f64,
+}
+
+// Cache writes are billed as a multiple of the input rate, by TTL.
+const CACHE_WRITE_5M_MULT: f64 = 1.25;
+const CACHE_WRITE_1H_MULT: f64 = 2.0;
+// Fast mode (`usage.speed == "fast"`) bills at 2x the standard rates.
+const FAST_MODE_MULT: f64 = 2.0;
+
+// Prices as of 2026-10; update when Anthropic's pricing page changes.
+const MODEL_RATES: &[(&str, Rates)] = &[
+    ("claude-fable-5-1", Rates { input: 10.0, output: 50.0, cache_read: 0.25 }),
+    ("claude-mythos-5-1", Rates { input: 10.0, output: 50.0, cache_read: 0.25 }),
+    ("claude-fable-5", Rates { input: 10.0, output: 50.0, cache_read: 1.0 }),
+    ("claude-mythos-5", Rates { input: 10.0, output: 50.0, cache_read: 1.0 }),
+    ("claude-opus-5-5", Rates { input: 4.0, output: 20.0, cache_read: 0.20 }),
+    ("claude-opus-5", Rates { input: 5.0, output: 25.0, cache_read: 0.50 }),
+    ("claude-opus-4-8", Rates { input: 5.0, output: 25.0, cache_read: 0.50 }),
+    ("claude-opus-4-7", Rates { input: 5.0, output: 25.0, cache_read: 0.50 }),
+    ("claude-opus-4-6", Rates { input: 5.0, output: 25.0, cache_read: 0.50 }),
+    ("claude-sonnet-5-5", Rates { input: 2.0, output: 10.0, cache_read: 0.20 }),
+    ("claude-sonnet-5", Rates { input: 2.0, output: 10.0, cache_read: 0.20 }),
+    ("claude-sonnet-4-6", Rates { input: 3.0, output: 15.0, cache_read: 0.30 }),
+    ("claude-haiku-4-5", Rates { input: 1.0, output: 5.0, cache_read: 0.10 }),
+];
+
+/// Looks up rates for a model id, tolerating provider prefixes (`us.anthropic.`) and
+/// date-pinned snapshots (`claude-haiku-4-5-20251001`).
+fn rates_for_model(model: &str) -> Option<Rates> {
+    let model = model.rsplit("anthropic.").next().unwrap_or(model);
+    let base = match model.rsplit_once('-') {
+        Some((head, tail)) if tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => model,
+    };
+    MODEL_RATES
+        .iter()
+        .find(|(id, _)| *id == base)
+        .map(|(_, rates)| *rates)
+}
+
 #[derive(Clone, Copy, Default)]
 struct TurnPoint {
     input: u64,
     output: u64,
     cache_read: u64,
     cache_create: u64,
+    /// Portion of `cache_create` written with the 1-hour TTL (the rest is 5-minute).
+    cache_create_1h: u64,
+    /// None when the model has no known price; such turns are excluded from cost totals.
+    rates: Option<Rates>,
+    fast: bool,
 }
 
 impl TurnPoint {
@@ -69,6 +119,23 @@ impl TurnPoint {
         self.output = self.output.max(other.output);
         self.cache_read = self.cache_read.max(other.cache_read);
         self.cache_create = self.cache_create.max(other.cache_create);
+        self.cache_create_1h = self.cache_create_1h.max(other.cache_create_1h);
+        self.rates = self.rates.or(other.rates);
+        self.fast |= other.fast;
+    }
+
+    /// What this turn would cost at Claude API list prices, in USD.
+    fn cost_usd(&self) -> Option<f64> {
+        let r = self.rates?;
+        let write_1h = self.cache_create_1h.min(self.cache_create);
+        let write_5m = self.cache_create - write_1h;
+        let per_mtok = self.input as f64 * r.input
+            + self.output as f64 * r.output
+            + self.cache_read as f64 * r.cache_read
+            + write_5m as f64 * r.input * CACHE_WRITE_5M_MULT
+            + write_1h as f64 * r.input * CACHE_WRITE_1H_MULT;
+        let speed = if self.fast { FAST_MODE_MULT } else { 1.0 };
+        Some(per_mtok / 1_000_000.0 * speed)
     }
 }
 
@@ -108,6 +175,14 @@ impl Stats {
         } else {
             read as f64 / total as f64 * 100.0
         }
+    }
+
+    fn total_cost_usd(&self) -> f64 {
+        self.turns.iter().filter_map(TurnPoint::cost_usd).sum()
+    }
+
+    fn unpriced_turns(&self) -> usize {
+        self.turns.iter().filter(|t| t.rates.is_none()).count()
     }
 
     fn total_tool_calls(&self) -> u64 {
@@ -211,11 +286,21 @@ impl SessionTail {
                     usage.get(key).and_then(Value::as_u64).unwrap_or(0)
                 };
                 if let Some(usage) = message.and_then(|m| m.get("usage")) {
+                    let model = message
+                        .and_then(|m| m.get("model"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
                     let point = TurnPoint {
                         input: get(usage, "input_tokens"),
                         output: get(usage, "output_tokens"),
                         cache_read: get(usage, "cache_read_input_tokens"),
                         cache_create: get(usage, "cache_creation_input_tokens"),
+                        cache_create_1h: usage
+                            .get("cache_creation")
+                            .map(|c| get(c, "ephemeral_1h_input_tokens"))
+                            .unwrap_or(0),
+                        rates: rates_for_model(model),
+                        fast: usage.get("speed").and_then(Value::as_str) == Some("fast"),
                     };
                     // Claude Code logs each content block of one API message as its own line,
                     // all carrying the same message id and usage; count each message once.
@@ -612,6 +697,14 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
+fn format_usd(amount: f64) -> String {
+    if amount > 0.0 && amount < 0.01 {
+        format!("${amount:.4}")
+    } else {
+        format!("${amount:.2}")
+    }
+}
+
 fn tool_mix(stats: &Stats) -> impl IntoElement {
     let mut rows: Vec<(&String, &ToolAgg)> = stats.tools.iter().collect();
     rows.sort_by(|a, b| b.1.count.cmp(&a.1.count).then(a.0.cmp(b.0)));
@@ -720,6 +813,10 @@ impl Render for SessionMonitor {
                     format!("Uncached input {}", format_tokens(t.input)),
                     format!("Output {}", format_tokens(t.output)),
                     format!("Hit rate {:.0}%", t.hit_rate()),
+                    match t.cost_usd() {
+                        Some(cost) => format!("Cost {}", format_usd(cost)),
+                        None => "Cost unknown (unpriced model)".to_string(),
+                    },
                 ],
             })
             .collect();
@@ -802,6 +899,11 @@ impl Render for SessionMonitor {
                     .child(stat_tile(
                         "CACHE HIT RATE",
                         format!("{:.1}%", stats.cache_hit_rate()),
+                        None,
+                    ))
+                    .child(stat_tile(
+                        if stats.unpriced_turns() > 0 { "API COST (PARTIAL)" } else { "API COST" },
+                        format_usd(stats.total_cost_usd()),
                         None,
                     ))
                     .child(stat_tile("TURNS", n_turns.to_string(), None))
@@ -1067,4 +1169,40 @@ fn main() {
         .unwrap();
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rates_lookup_handles_prefixes_and_snapshots() {
+        let opus = rates_for_model("claude-opus-5-5").unwrap();
+        assert_eq!(opus.input, 4.0);
+        assert_eq!(rates_for_model("us.anthropic.claude-opus-5-5"), Some(opus));
+        assert_eq!(rates_for_model("claude-haiku-4-5-20251001").unwrap().input, 1.0);
+        // "claude-opus-5" must not swallow "claude-opus-5-5" or vice versa.
+        assert_eq!(rates_for_model("claude-opus-5").unwrap().input, 5.0);
+        assert_eq!(rates_for_model("<synthetic>"), None);
+        assert_eq!(rates_for_model("opus"), None);
+    }
+
+    #[test]
+    fn turn_cost_splits_cache_writes_by_ttl() {
+        let turn = TurnPoint {
+            input: 1_000_000,
+            output: 1_000_000,
+            cache_read: 1_000_000,
+            cache_create: 2_000_000,
+            cache_create_1h: 1_000_000,
+            rates: rates_for_model("claude-opus-5-5"),
+            fast: false,
+        };
+        // 4 input + 20 output + 0.20 read + 5 (5m write) + 8 (1h write)
+        assert!((turn.cost_usd().unwrap() - 37.20).abs() < 1e-9);
+        let fast = TurnPoint { fast: true, ..turn };
+        assert!((fast.cost_usd().unwrap() - 74.40).abs() < 1e-9);
+        let unknown = TurnPoint { rates: None, ..turn };
+        assert_eq!(unknown.cost_usd(), None);
+    }
 }
