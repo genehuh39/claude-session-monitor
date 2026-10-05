@@ -1,20 +1,23 @@
 mod pricing;
+mod sessions;
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    div, point, prelude::*, px, relative, rgb, size, uniform_list, AnyView, App, AppContext as _,
-    Bounds, Context, Decorations, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels,
-    ScrollHandle, SharedString, Size, TitlebarOptions, Window, WindowBounds, WindowOptions,
+    anchored, deferred, div, point, prelude::*, px, relative, rgb, size, uniform_list, AnyView,
+    App, Bounds, Context, Decorations, MouseButton, MouseDownEvent,
+    MouseMoveEvent, Pixels, ScrollHandle, SharedString, Size, TitlebarOptions, Window,
+    WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 use pricing::{PriceSource, PriceTable, Usage};
 use serde_json::Value;
+use sessions::{AgentRun, SessionFile, SessionSummary};
 
 const MAX_RECENT_TOOL_CALLS: usize = 200;
 const CHART_TURNS: usize = 60;
@@ -33,6 +36,8 @@ const TITLE_BAR_H: f32 = 32.0;
 const SCROLLBAR_W: f32 = 10.0;
 const SCROLLBAR_MIN_THUMB: f32 = 24.0;
 const BOTTOM_ROW_MIN_H: f32 = 320.0;
+const COSTLIEST_ROWS: usize = 5;
+const PICKER_SESSIONS: usize = 10;
 
 // Validated dark palette (dataviz skill): surface #1a1a19, categorical slots 1-4.
 const PAGE: u32 = 0x0d0d0d;
@@ -63,6 +68,21 @@ struct TurnPoint {
     model: Option<u16>,
     fast: bool,
     us_geo: bool,
+    at: Option<DateTime<Utc>>,
+    /// What the model was responding to.
+    trigger: Trigger,
+}
+
+/// The event that prompted a turn.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+enum Trigger {
+    /// Another API call within the same response, with no new input in between.
+    #[default]
+    Continuation,
+    Prompt,
+    Compaction,
+    /// A tool result; index into `Stats::tool_names`.
+    Tool(u16),
 }
 
 impl TurnPoint {
@@ -89,6 +109,7 @@ impl TurnPoint {
         self.model = self.model.or(other.model);
         self.fast |= other.fast;
         self.us_geo |= other.us_geo;
+        self.at = self.at.or(other.at);
     }
 
     fn usage(&self) -> Usage {
@@ -132,6 +153,10 @@ struct Stats {
     turn_index: HashMap<String, usize>,
     /// Distinct model ids seen this session, referenced by `TurnPoint::model`.
     models: Vec<String>,
+    /// Tool names referenced by `Trigger::Tool`.
+    tool_names: Vec<String>,
+    /// Working directory the session was started in.
+    cwd: Option<String>,
     tools: HashMap<String, ToolAgg>,
     recent_tool_calls: VecDeque<ToolCallEntry>,
 }
@@ -139,16 +164,6 @@ struct Stats {
 impl Stats {
     fn sum(&self, f: impl Fn(&TurnPoint) -> u64) -> u64 {
         self.turns.iter().map(f).sum()
-    }
-
-    fn cache_hit_rate(&self) -> f64 {
-        let read = self.sum(|t| t.cache_read);
-        let total = self.sum(|t| t.prompt_total());
-        if total == 0 {
-            0.0
-        } else {
-            read as f64 / total as f64 * 100.0
-        }
     }
 
     fn intern_model(&mut self, model: &str) -> Option<u16> {
@@ -227,46 +242,109 @@ impl Stats {
     fn total_tool_calls(&self) -> u64 {
         self.tools.values().map(|t| t.count).sum()
     }
-}
 
-/// Finds the most recently modified session transcript across all Claude Code projects.
-fn find_active_session() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let projects_dir = Path::new(&home).join(".claude/projects");
-    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
-
-    for project_entry in fs::read_dir(&projects_dir).ok()? {
-        let project_entry = project_entry.ok()?;
-        if !project_entry.path().is_dir() {
-            continue;
-        }
-        let Ok(entries) = fs::read_dir(project_entry.path()) else {
-            continue;
+    fn intern_tool(&mut self, name: &str) -> Option<u16> {
+        let ix = match self.tool_names.iter().position(|n| n == name) {
+            Some(ix) => ix,
+            None => {
+                self.tool_names.push(name.to_string());
+                self.tool_names.len() - 1
+            }
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
-            let Ok(modified) = metadata.modified() else {
-                continue;
-            };
-            if newest.as_ref().map_or(true, |(t, _)| modified > *t) {
-                newest = Some((modified, path));
-            }
+        u16::try_from(ix).ok()
+    }
+
+    fn trigger_label(&self, trigger: Trigger) -> String {
+        match trigger {
+            Trigger::Continuation => "continuation".to_string(),
+            Trigger::Prompt => "after user prompt".to_string(),
+            Trigger::Compaction => "after compaction".to_string(),
+            Trigger::Tool(ix) => match self.tool_names.get(ix as usize) {
+                Some(name) => format!("after {name}"),
+                None => "after tool result".to_string(),
+            },
         }
     }
 
-    newest.map(|(_, path)| path)
+    /// The token category that contributed most to a turn's cost.
+    fn cost_driver(&self, turn: &TurnPoint, prices: &PriceTable) -> Option<CostDriver> {
+        let price = prices.lookup(self.model_of(turn)?)?;
+        let u = turn.usage();
+        let only = |f: &dyn Fn(&mut Usage)| {
+            let mut part = Usage {
+                fast: u.fast,
+                us_geo: u.us_geo,
+                ..Default::default()
+            };
+            f(&mut part);
+            price.cost_usd(&part)
+        };
+        [
+            (
+                CostDriver::CacheWrite,
+                only(&|p| {
+                    p.cache_write_5m = u.cache_write_5m;
+                    p.cache_write_1h = u.cache_write_1h;
+                }),
+            ),
+            (CostDriver::Output, only(&|p| p.output = u.output)),
+            (CostDriver::Input, only(&|p| p.input = u.input)),
+            (
+                CostDriver::CacheRead,
+                only(&|p| p.cache_read = u.cache_read),
+            ),
+        ]
+        .into_iter()
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .filter(|(_, cost)| *cost > 0.0)
+        .map(|(driver, _)| driver)
+    }
+
+    /// The model used on most turns.
+    fn main_model(&self) -> Option<&str> {
+        let mut counts = vec![0usize; self.models.len()];
+        for ix in self.turns.iter().filter_map(|t| t.model) {
+            counts[ix as usize] += 1;
+        }
+        let best = (0..counts.len()).max_by_key(|&ix| counts[ix])?;
+        self.models.get(best).map(String::as_str)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CostDriver {
+    CacheWrite,
+    Output,
+    Input,
+    CacheRead,
+}
+
+impl CostDriver {
+    fn color(self) -> u32 {
+        match self {
+            CostDriver::CacheWrite => C_WRITE,
+            CostDriver::Output => C_OUTPUT,
+            CostDriver::Input => C_INPUT,
+            CostDriver::CacheRead => C_READ,
+        }
+    }
+
+    fn describe(self, turn: &TurnPoint) -> String {
+        match self {
+            CostDriver::CacheWrite => format!("cache write {}", format_tokens(turn.cache_create)),
+            CostDriver::Output => format!("output {}", format_tokens(turn.output)),
+            CostDriver::Input => format!("uncached input {}", format_tokens(turn.input)),
+            CostDriver::CacheRead => format!("cache read {}", format_tokens(turn.cache_read)),
+        }
+    }
 }
 
 struct SessionTail {
     path: PathBuf,
     offset: u64,
     pending_tool_calls: HashMap<String, (String, DateTime<Utc>)>,
+    /// What the next new turn is responding to.
+    next_trigger: Trigger,
 }
 
 impl SessionTail {
@@ -275,6 +353,7 @@ impl SessionTail {
             path,
             offset: 0,
             pending_tool_calls: HashMap::new(),
+            next_trigger: Trigger::Continuation,
         }
     }
 
@@ -317,6 +396,9 @@ impl SessionTail {
             .and_then(Value::as_str)
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc));
+        if stats.cwd.is_none() {
+            stats.cwd = obj.get("cwd").and_then(Value::as_str).map(str::to_string);
+        }
 
         match entry_type {
             "assistant" => {
@@ -344,6 +426,8 @@ impl SessionTail {
                         model: stats.intern_model(model),
                         fast: usage.get("speed").and_then(Value::as_str) == Some("fast"),
                         us_geo: usage.get("inference_geo").and_then(Value::as_str) == Some("us"),
+                        at: timestamp,
+                        trigger: self.next_trigger,
                     };
                     // Claude Code logs each content block of one API message as its own line,
                     // all carrying the same message id and usage; count each message once.
@@ -358,6 +442,7 @@ impl SessionTail {
                                 stats.turn_index.insert(id, stats.turns.len());
                             }
                             stats.turns.push(point);
+                            self.next_trigger = Trigger::Continuation;
                         }
                     }
                 }
@@ -379,12 +464,30 @@ impl SessionTail {
                     }
                 }
             }
+            "system" => {
+                if obj.get("subtype").and_then(Value::as_str) == Some("compact_boundary") {
+                    self.next_trigger = Trigger::Compaction;
+                }
+            }
             "user" => {
                 let message = obj.get("message");
-                if let Some(content) = message
-                    .and_then(|m| m.get("content"))
-                    .and_then(Value::as_array)
-                {
+                let content = message.and_then(|m| m.get("content"));
+                let flag = |key: &str| obj.get(key).and_then(Value::as_bool).unwrap_or(false);
+                if flag("isCompactSummary") {
+                    self.next_trigger = Trigger::Compaction;
+                } else if !flag("isMeta") {
+                    let typed_text = match content {
+                        Some(Value::String(_)) => true,
+                        Some(Value::Array(items)) => items
+                            .iter()
+                            .any(|i| i.get("type").and_then(Value::as_str) == Some("text")),
+                        _ => false,
+                    };
+                    if typed_text {
+                        self.next_trigger = Trigger::Prompt;
+                    }
+                }
+                if let Some(content) = content.and_then(Value::as_array) {
                     for item in content {
                         if item.get("type").and_then(Value::as_str) != Some("tool_result") {
                             continue;
@@ -395,6 +498,9 @@ impl SessionTail {
                         let Some((name, start)) = self.pending_tool_calls.remove(id) else {
                             continue;
                         };
+                        if let Some(ix) = stats.intern_tool(&name) {
+                            self.next_trigger = Trigger::Tool(ix);
+                        }
                         let latency_ms = timestamp.map(|end| (end - start).num_milliseconds());
                         let is_error = item
                             .get("is_error")
@@ -439,8 +545,21 @@ struct SessionMonitor {
     body_scroll: ScrollHandle,
     scrollbar_drag: Option<ScrollbarDrag>,
     session_path: Option<PathBuf>,
+    session_modified: Option<SystemTime>,
+    /// Stay on the chosen session instead of following the most recently active one.
+    pinned: bool,
     tail: Option<SessionTail>,
     stats: Stats,
+    agents: Vec<AgentRun>,
+    /// Main-session turn under the pointer in the costliest-turns list.
+    hovered_turn: Option<usize>,
+    picker_open: bool,
+    /// When a click outside last closed the picker, so the same click on the chip doesn't
+    /// immediately reopen it.
+    picker_dismissed_at: Option<Instant>,
+    picker_sessions: Vec<SessionFile>,
+    summaries: HashMap<PathBuf, SessionSummary>,
+    summaries_in_flight: bool,
     prices: PriceTable,
     last_price_fetch: Option<Instant>,
     price_fetch_in_flight: bool,
@@ -453,8 +572,17 @@ impl SessionMonitor {
             body_scroll: ScrollHandle::new(),
             scrollbar_drag: None,
             session_path: None,
+            session_modified: None,
+            pinned: false,
             tail: None,
             stats: Stats::default(),
+            agents: Vec::new(),
+            hovered_turn: None,
+            picker_open: false,
+            picker_dismissed_at: None,
+            picker_sessions: Vec::new(),
+            summaries: HashMap::new(),
+            summaries_in_flight: false,
             prices: PriceTable::load(),
             last_price_fetch: None,
             price_fetch_in_flight: false,
@@ -511,15 +639,33 @@ impl SessionMonitor {
         this
     }
 
-    /// Switches to the most recently active session; returns whether it changed.
+    fn open_session(&mut self, path: PathBuf) {
+        self.session_modified = sessions::modified(&path);
+        self.session_path = Some(path.clone());
+        self.tail = Some(SessionTail::new(path));
+        self.stats = Stats::default();
+        self.agents.clear();
+        self.hovered_turn = None;
+    }
+
+    /// While following, moves to the most recently active session once the current one has
+    /// gone quiet; returns whether it changed.
     fn rescan(&mut self) -> bool {
-        if let Some(path) = find_active_session() {
-            if self.session_path.as_ref() != Some(&path) {
-                self.session_path = Some(path.clone());
-                self.tail = Some(SessionTail::new(path));
-                self.stats = Stats::default();
-                return true;
-            }
+        if self.pinned && self.session_path.is_some() {
+            return false;
+        }
+        let Some(newest) = sessions::list_sessions().into_iter().next() else {
+            return false;
+        };
+        let follow = sessions::should_follow(
+            self.session_path.as_deref(),
+            self.session_path.as_deref().and_then(sessions::modified),
+            &newest.path,
+            SystemTime::now(),
+        );
+        if follow && self.session_path.as_ref() != Some(&newest.path) {
+            self.open_session(newest.path);
+            return true;
         }
         false
     }
@@ -530,7 +676,85 @@ impl SessionMonitor {
         if let Some(tail) = &mut self.tail {
             let _ = tail.poll(&mut self.stats);
         }
+        if let Some(path) = &self.session_path {
+            self.session_modified = sessions::modified(path);
+            sessions::sync_agents(path, &mut self.agents);
+        }
         switched
+    }
+
+    /// The main session followed by each subagent run.
+    fn all_stats(&self) -> impl Iterator<Item = &Stats> {
+        std::iter::once(&self.stats).chain(self.agents.iter().map(|a| &a.stats))
+    }
+
+    fn select_session(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.picker_open = false;
+        self.pinned = true;
+        if self.session_path.as_ref() != Some(&path) {
+            self.open_session(path);
+            self.refresh();
+            self.refresh_prices(cx);
+        }
+        cx.notify();
+    }
+
+    fn toggle_picker(&mut self, cx: &mut Context<Self>) {
+        let just_dismissed = self
+            .picker_dismissed_at
+            .is_some_and(|at| at.elapsed() < Duration::from_millis(300));
+        if just_dismissed && !self.picker_open {
+            self.picker_dismissed_at = None;
+            return;
+        }
+        self.picker_open = !self.picker_open;
+        if self.picker_open {
+            self.picker_sessions = sessions::list_sessions();
+            self.picker_sessions.truncate(PICKER_SESSIONS);
+            self.summarize_picker_sessions(cx);
+        }
+        cx.notify();
+    }
+
+    /// Reads the picker's sessions in the background for their project and cost, skipping any
+    /// already summarized at their current length.
+    fn summarize_picker_sessions(&mut self, cx: &mut Context<Self>) {
+        if self.summaries_in_flight {
+            return;
+        }
+        let stale: Vec<PathBuf> = self
+            .picker_sessions
+            .iter()
+            .filter(|s| {
+                self.summaries
+                    .get(&s.path)
+                    .is_none_or(|sum| sum.len != sessions::file_len(&s.path))
+            })
+            .map(|s| s.path.clone())
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        self.summaries_in_flight = true;
+        let prices = self.prices.clone();
+        let task = cx.background_executor().spawn(async move {
+            stale
+                .into_iter()
+                .map(|path| {
+                    let summary = sessions::summarize(&path, &prices);
+                    (path, summary)
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let results = task.await;
+            this.update(cx, |this, cx| {
+                this.summaries_in_flight = false;
+                this.summaries.extend(results);
+                cx.notify();
+            })
+        })
+        .detach();
     }
 
     fn price_source_label(&self) -> String {
@@ -619,7 +843,7 @@ fn tip_builder(lines: Vec<String>) -> impl Fn(&mut Window, &mut App) -> AnyView 
 
 // ---------- building blocks ----------
 
-fn stat_tile(label: &str, value: String, swatch: Option<u32>) -> impl IntoElement {
+fn stat_tile(label: &str, value: String, swatch: Option<u32>) -> gpui::Div {
     let mut label_row = div().flex().flex_row().items_center().gap_2();
     if let Some(color) = swatch {
         label_row = label_row.child(div().size(px(8.0)).rounded_sm().bg(rgb(color)));
@@ -644,6 +868,10 @@ fn stat_tile(label: &str, value: String, swatch: Option<u32>) -> impl IntoElemen
         .min_w(px(132.0))
         .child(label_row)
         .child(div().text_xl().text_color(rgb(INK)).child(value))
+}
+
+fn tile_detail(text: String) -> impl IntoElement {
+    div().text_xs().text_color(rgb(MUTED)).child(text)
 }
 
 fn legend(items: &[(&str, u32)]) -> impl IntoElement {
@@ -733,6 +961,7 @@ fn bar_chart(
     max: f64,
     y_labels: [String; 3],
     x_labels: (String, String),
+    highlight: Option<usize>,
 ) -> impl IntoElement {
     let mut bars = div()
         .absolute()
@@ -754,6 +983,9 @@ fn bar_chart(
             .gap_0p5()
             .hover(|s| s.bg(rgb(HOVER_WASH)))
             .tooltip(tip_builder(col.tip));
+        if highlight == Some(i) {
+            stack = stack.bg(rgb(BASELINE)).rounded_t_sm();
+        }
         let visible: Vec<(f64, u32)> = col.segs.into_iter().filter(|(v, _)| *v > 0.0).collect();
         for (n, (value, color)) in visible.into_iter().enumerate() {
             let h = (value / max * (PLOT_H - 6.0)).max(2.0);
@@ -1070,12 +1302,58 @@ impl Render for SessionMonitor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let stats = &self.stats;
         let prices = &self.prices;
-        let session_name = self
-            .session_path
-            .as_ref()
-            .and_then(|p| p.file_stem())
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "no active session found".to_string());
+        // Token and cost tiles cover the whole session, subagents included; charts and tool
+        // panels show the main conversation.
+        let total =
+            |f: &dyn Fn(&TurnPoint) -> u64| -> u64 { self.all_stats().map(|s| s.sum(f)).sum() };
+        let all_read = total(&|t| t.cache_read);
+        let all_prompt = total(&|t| t.prompt_total());
+        let all_hit_rate = if all_prompt == 0 {
+            0.0
+        } else {
+            all_read as f64 / all_prompt as f64 * 100.0
+        };
+        let main_cost = stats.total_cost_usd(prices);
+        let agent_costs: Vec<f64> = self
+            .agents
+            .iter()
+            .map(|a| a.stats.total_cost_usd(prices))
+            .collect();
+        let agent_cost: f64 = agent_costs.iter().sum();
+        let partial = self.all_stats().any(|s| s.unpriced_turns(prices) > 0);
+        let agent_turns: usize = self.agents.iter().map(|a| a.stats.turns.len()).sum();
+
+        let mut cost_tile = stat_tile(
+            if partial {
+                "API COST (PARTIAL)"
+            } else {
+                "API COST"
+            },
+            format_usd(main_cost + agent_cost),
+            None,
+        );
+        let mut cost_tip = vec![format!("Main conversation {}", format_usd(main_cost))];
+        if !self.agents.is_empty() {
+            let n = self.agents.len();
+            cost_tile = cost_tile.child(tile_detail(format!(
+                "main {} · {n} agent{} {}",
+                format_usd(main_cost),
+                if n == 1 { "" } else { "s" },
+                format_usd(agent_cost)
+            )));
+            for (agent, cost) in self.agents.iter().zip(&agent_costs) {
+                cost_tip.push(format!(
+                    "{}: {} turns, {}",
+                    agent.label(),
+                    agent.stats.turns.len(),
+                    format_usd(*cost)
+                ));
+            }
+        }
+        let mut turns_tile = stat_tile("TURNS", stats.turns.len().to_string(), None);
+        if agent_turns > 0 {
+            turns_tile = turns_tile.child(tile_detail(format!("+{agent_turns} in agents")));
+        }
 
         let n_turns = stats.turns.len();
         let start = n_turns.saturating_sub(CHART_TURNS);
@@ -1092,6 +1370,12 @@ impl Render for SessionMonitor {
                 format!("turn {n_turns}")
             },
         );
+
+        // Hovering a costliest-turns row marks that turn in both charts.
+        let highlight = self
+            .hovered_turn
+            .and_then(|ix| ix.checked_sub(start))
+            .filter(|&ix| ix < window_turns.len());
 
         // Chart A: prompt composition per turn (stacked).
         let max_prompt = window_turns
@@ -1133,6 +1417,7 @@ impl Render for SessionMonitor {
                 "0".to_string(),
             ],
             x_labels.clone(),
+            highlight,
         );
 
         // Chart B: cache hit rate per turn.
@@ -1154,6 +1439,7 @@ impl Render for SessionMonitor {
             100.0,
             ["100%".to_string(), "50%".to_string(), "0%".to_string()],
             x_labels,
+            highlight,
         );
         let low_turns = window_turns.iter().filter(|t| t.hit_rate() < 50.0).count();
 
@@ -1170,12 +1456,7 @@ impl Render for SessionMonitor {
             .p_4()
             .pr(px(SCROLLBAR_W + 8.0))
             .gap_3()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child(format!("session: {session_name}")),
-            )
+            .child(self.session_header(cx))
             .child(
                 div()
                     .flex()
@@ -1184,39 +1465,31 @@ impl Render for SessionMonitor {
                     .flex_wrap()
                     .child(stat_tile(
                         "UNCACHED INPUT",
-                        format_tokens(stats.sum(|t| t.input)),
+                        format_tokens(total(&|t| t.input)),
                         Some(C_INPUT),
                     ))
                     .child(stat_tile(
                         "OUTPUT",
-                        format_tokens(stats.sum(|t| t.output)),
+                        format_tokens(total(&|t| t.output)),
                         Some(C_OUTPUT),
                     ))
                     .child(stat_tile(
                         "CACHE READ",
-                        format_tokens(stats.sum(|t| t.cache_read)),
+                        format_tokens(all_read),
                         Some(C_READ),
                     ))
                     .child(stat_tile(
                         "CACHE WRITE",
-                        format_tokens(stats.sum(|t| t.cache_create)),
+                        format_tokens(total(&|t| t.cache_create)),
                         Some(C_WRITE),
                     ))
                     .child(stat_tile(
                         "CACHE HIT RATE",
-                        format!("{:.1}%", stats.cache_hit_rate()),
+                        format!("{all_hit_rate:.1}%"),
                         None,
                     ))
-                    .child(stat_tile(
-                        if stats.unpriced_turns(prices) > 0 {
-                            "API COST (PARTIAL)"
-                        } else {
-                            "API COST"
-                        },
-                        format_usd(stats.total_cost_usd(prices)),
-                        None,
-                    ))
-                    .child(stat_tile("TURNS", n_turns.to_string(), None))
+                    .child(cost_tile.id("cost-tile").tooltip(tip_builder(cost_tip)))
+                    .child(turns_tile)
                     .child(stat_tile(
                         "TOOL CALLS",
                         stats.total_tool_calls().to_string(),
@@ -1253,6 +1526,7 @@ impl Render for SessionMonitor {
                         .min_w(px(0.0)),
                     ),
             )
+            .child(self.costliest_card(cx))
             .child(
                 div()
                     .flex()
@@ -1393,6 +1667,453 @@ impl Render for SessionMonitor {
                 cx.listener(|this, _, _, _| this.scrollbar_drag = None),
             )
     }
+}
+
+/// A row in the costliest-turns card.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Costly {
+    /// Index into the main session's turns.
+    Turn(usize),
+    /// Index into the session's subagent runs, ranked by the run's total cost.
+    Agent(usize),
+}
+
+/// The `n` most expensive main-session turns and subagent runs, most expensive first.
+fn costliest(
+    stats: &Stats,
+    agent_costs: &[f64],
+    prices: &PriceTable,
+    n: usize,
+) -> Vec<(Costly, f64)> {
+    let mut rows: Vec<(Costly, f64)> = stats
+        .turns
+        .iter()
+        .enumerate()
+        .filter_map(|(ix, t)| Some((Costly::Turn(ix), stats.turn_cost(t, prices)?)))
+        .chain(
+            agent_costs
+                .iter()
+                .enumerate()
+                .map(|(ix, cost)| (Costly::Agent(ix), *cost)),
+        )
+        .filter(|(_, cost)| *cost > 0.0)
+        .collect();
+    rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+    rows.truncate(n);
+    rows
+}
+
+fn short_model_name(model: Option<&str>, prices: &PriceTable) -> String {
+    let Some(model) = model else {
+        return "-".to_string();
+    };
+    match prices.lookup(model) {
+        Some(price) => price.name.trim_start_matches("Claude ").to_string(),
+        None => model.to_string(),
+    }
+}
+
+fn local_time(at: Option<DateTime<Utc>>, fmt: &str) -> String {
+    at.map(|at| at.with_timezone(&chrono::Local).format(fmt).to_string())
+        .unwrap_or_default()
+}
+
+impl SessionMonitor {
+    /// The session chip (opens the session picker), the follow/pin toggle, and a subagent note.
+    fn session_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let label = match &self.session_path {
+            Some(path) => format!(
+                "{} · {}",
+                sessions::project_name(self.stats.cwd.as_deref(), path),
+                sessions::short_id(path)
+            ),
+            None => "no session found".to_string(),
+        };
+        let live = sessions::is_live(self.session_modified);
+        let chip = div()
+            .id("session-chip")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(GRID))
+            .bg(rgb(SURFACE))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(HOVER_WASH)))
+            .tooltip(tip_builder(vec![
+                "Choose a session".to_string(),
+                match &self.session_path {
+                    Some(path) => path.display().to_string(),
+                    None => "~/.claude/projects is empty".to_string(),
+                },
+            ]))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_picker(cx)))
+            .child(status_dot(live))
+            .child(div().text_xs().text_color(rgb(INK)).child(label))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(if self.picker_open { "▴" } else { "▾" }),
+            );
+
+        let (mode, mode_tip) = if self.pinned {
+            (
+                "PINNED",
+                "Staying on this session. Click to follow the latest session.",
+            )
+        } else {
+            (
+                "FOLLOWING LATEST",
+                "Switches to the newest session once this one has been idle for a minute. \
+                 Click to pin this session.",
+            )
+        };
+        let mode_badge = div()
+            .id("follow-mode")
+            .px_2()
+            .py_0p5()
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(if self.pinned { C_OUTPUT } else { BASELINE }))
+            .text_xs()
+            .text_color(rgb(if self.pinned { C_OUTPUT } else { INK_2 }))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(HOVER_WASH)))
+            .tooltip(tip_builder(vec![mode_tip.to_string()]))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.pinned = !this.pinned;
+                this.refresh();
+                cx.notify();
+            }))
+            .child(mode);
+
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap_3()
+            .child(chip)
+            .child(mode_badge);
+        let n = self.agents.len();
+        if n > 0 {
+            row = row.child(tile_detail(format!(
+                "totals include {n} subagent{}",
+                if n == 1 { "" } else { "s" }
+            )));
+        }
+
+        let mut header = div().flex().flex_col().child(row);
+        if self.picker_open {
+            header = header.child(
+                deferred(
+                    anchored()
+                        .snap_to_window_with_margin(px(8.0))
+                        .child(self.session_menu(cx)),
+                )
+                .with_priority(1),
+            );
+        }
+        header
+    }
+
+    fn session_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut menu = div()
+            .id("session-menu")
+            .occlude()
+            .mt_1()
+            .w(px(480.0))
+            .flex()
+            .flex_col()
+            .p_1()
+            .bg(rgb(SURFACE))
+            .border_1()
+            .border_color(rgb(BASELINE))
+            .rounded_md()
+            .shadow_lg()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.picker_open = false;
+                this.picker_dismissed_at = Some(Instant::now());
+                cx.notify();
+            }));
+
+        menu = menu.child(
+            menu_row("follow-latest", !self.pinned)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.picker_open = false;
+                    this.pinned = false;
+                    this.refresh();
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .w(px(12.0))
+                        .text_xs()
+                        .text_color(rgb(C_READ))
+                        .child(if self.pinned { "" } else { "✓" }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_xs()
+                        .text_color(rgb(INK))
+                        .child("Follow the latest session"),
+                ),
+        );
+        menu = menu.child(div().my_1().h(px(1.0)).bg(rgb(GRID)));
+
+        if self.picker_sessions.is_empty() {
+            menu = menu.child(
+                div()
+                    .p_2()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("no sessions in ~/.claude/projects"),
+            );
+        }
+        for (ix, session) in self.picker_sessions.iter().enumerate() {
+            let current = self.session_path.as_ref() == Some(&session.path);
+            let summary = self.summaries.get(&session.path);
+            let project =
+                sessions::project_name(summary.and_then(|s| s.cwd.as_deref()), &session.path);
+            let cost = match summary {
+                Some(s) if s.partial => format!("{}+", format_usd(s.cost)),
+                Some(s) => format_usd(s.cost),
+                None => "…".to_string(),
+            };
+            let path = session.path.clone();
+            menu = menu.child(
+                menu_row(("session", ix), current)
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.select_session(path.clone(), cx)),
+                    )
+                    .child(
+                        div()
+                            .w(px(12.0))
+                            .child(status_dot(sessions::is_live(Some(session.modified)))),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_xs()
+                            .text_color(rgb(INK))
+                            .child(project),
+                    )
+                    .child(
+                        div()
+                            .w(px(72.0))
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(session.short_id()),
+                    )
+                    .child(
+                        div()
+                            .w(px(64.0))
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(format_ago(DateTime::<Utc>::from(session.modified))),
+                    )
+                    .child(
+                        div()
+                            .w(px(64.0))
+                            .flex()
+                            .justify_end()
+                            .text_xs()
+                            .text_color(rgb(INK))
+                            .child(cost),
+                    ),
+            );
+        }
+        menu
+    }
+
+    /// The most expensive turns and subagent runs, with what drove each one's cost.
+    fn costliest_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let stats = &self.stats;
+        let prices = &self.prices;
+        let agent_costs: Vec<f64> = self
+            .agents
+            .iter()
+            .map(|a| a.stats.total_cost_usd(prices))
+            .collect();
+        let rows = costliest(stats, &agent_costs, prices, COSTLIEST_ROWS);
+        let session_cost = stats.total_cost_usd(prices) + agent_costs.iter().sum::<f64>();
+        let top_cost: f64 = rows.iter().map(|(_, cost)| cost).sum();
+        let max = rows
+            .first()
+            .map_or(1.0, |(_, cost)| *cost)
+            .max(f64::EPSILON);
+        let chart_start = stats.turns.len().saturating_sub(CHART_TURNS);
+
+        let subtitle = if rows.is_empty() {
+            "per API call, at API prices".to_string()
+        } else {
+            format!(
+                "top {} = {:.0}% of {} session cost",
+                rows.len(),
+                top_cost / session_cost.max(f64::EPSILON) * 100.0,
+                format_usd(session_cost)
+            )
+        };
+
+        let mut list = div().flex().flex_col().gap_0p5();
+        if rows.is_empty() {
+            list = list.child(tile_detail("no priced turns yet".to_string()));
+        }
+        let cell = |w: f32| div().w(px(w)).flex_none().truncate().text_xs();
+        for (rank, (item, cost)) in rows.into_iter().enumerate() {
+            let frac = (cost / max) as f32;
+            let row = div()
+                .id(("costly", rank))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .h(px(24.0))
+                .px_1()
+                .rounded_sm()
+                .hover(|s| s.bg(rgb(HOVER_WASH)));
+            let bar = |color: u32| {
+                div().flex_1().min_w(px(40.0)).h(px(8.0)).child(
+                    div()
+                        .h_full()
+                        .w(relative(frac))
+                        .bg(rgb(color))
+                        .rounded_r_sm(),
+                )
+            };
+            let cost_cell = cell(64.0)
+                .flex()
+                .justify_end()
+                .text_color(rgb(INK))
+                .child(format_usd(cost));
+
+            let row = match item {
+                Costly::Turn(ix) => {
+                    let t = &stats.turns[ix];
+                    let driver = stats.cost_driver(t, prices);
+                    let trigger = stats.trigger_label(t.trigger);
+                    let mut tip = vec![
+                        format!("Turn {} at {}", ix + 1, local_time(t.at, "%H:%M:%S")),
+                        format!("Cost {}", format_usd(cost)),
+                        format!("Cache write {}", format_tokens(t.cache_create)),
+                        format!("Output {}", format_tokens(t.output)),
+                        format!("Uncached input {}", format_tokens(t.input)),
+                        format!("Cache read {}", format_tokens(t.cache_read)),
+                        trigger.clone(),
+                    ];
+                    if ix < chart_start {
+                        tip.push(format!("older than the last {CHART_TURNS} charted turns"));
+                    }
+                    row.tooltip(tip_builder(tip))
+                        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                            if *hovered {
+                                this.hovered_turn = Some(ix);
+                            } else if this.hovered_turn == Some(ix) {
+                                this.hovered_turn = None;
+                            }
+                            cx.notify();
+                        }))
+                        .child(
+                            cell(44.0)
+                                .text_color(rgb(INK_2))
+                                .child(format!("#{}", ix + 1)),
+                        )
+                        .child(
+                            cell(40.0)
+                                .text_color(rgb(MUTED))
+                                .child(local_time(t.at, "%H:%M")),
+                        )
+                        .child(bar(driver.map_or(MUTED, CostDriver::color)))
+                        .child(cost_cell)
+                        .child(
+                            cell(88.0)
+                                .text_color(rgb(INK_2))
+                                .child(short_model_name(stats.model_of(t), prices)),
+                        )
+                        .child(
+                            cell(130.0)
+                                .text_color(rgb(INK_2))
+                                .child(driver.map_or_else(String::new, |d| d.describe(t))),
+                        )
+                        .child(cell(150.0).text_color(rgb(MUTED)).child(trigger))
+                }
+                Costly::Agent(ix) => {
+                    let agent = &self.agents[ix];
+                    let turns = agent.stats.turns.len();
+                    let mut tip = vec![
+                        format!("Subagent {} ({})", agent.label(), agent.id),
+                        format!("Cost {} over {turns} turns", format_usd(cost)),
+                    ];
+                    if let Some(description) = &agent.description {
+                        tip.push(description.clone());
+                    }
+                    let started = agent.stats.turns.first().and_then(|t| t.at);
+                    row.tooltip(tip_builder(tip))
+                        .child(cell(44.0).text_color(rgb(MUTED)).child("⤷ agent"))
+                        .child(
+                            cell(40.0)
+                                .text_color(rgb(MUTED))
+                                .child(local_time(started, "%H:%M")),
+                        )
+                        .child(bar(MUTED))
+                        .child(cost_cell)
+                        .child(
+                            cell(88.0)
+                                .text_color(rgb(INK_2))
+                                .child(short_model_name(agent.stats.main_model(), prices)),
+                        )
+                        .child(
+                            cell(130.0)
+                                .text_color(rgb(INK_2))
+                                .child(agent.label().to_string()),
+                        )
+                        .child(cell(150.0).text_color(rgb(MUTED)).child(format!(
+                            "{turns} turns{}",
+                            agent
+                                .description
+                                .as_ref()
+                                .map_or_else(String::new, |d| format!(" · {d}"))
+                        )))
+                }
+            };
+            list = list.child(row);
+        }
+
+        chart_card("Costliest turns", subtitle, None, list)
+    }
+}
+
+fn status_dot(live: bool) -> impl IntoElement {
+    div()
+        .size(px(8.0))
+        .rounded_full()
+        .bg(rgb(if live { C_INPUT } else { MUTED }))
+}
+
+fn menu_row(id: impl Into<gpui::ElementId>, selected: bool) -> gpui::Stateful<gpui::Div> {
+    let mut row = div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .h(px(28.0))
+        .px_2()
+        .rounded_sm()
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(HOVER_WASH)));
+    if selected {
+        row = row.bg(rgb(GRID));
+    }
+    row
 }
 
 impl SessionMonitor {
@@ -1644,5 +2365,120 @@ mod tests {
             stats.model_of(stats.current_turn().unwrap()),
             Some("mystery-model")
         );
+    }
+
+    fn feed(tail: &mut SessionTail, stats: &mut Stats, lines: &[serde_json::Value]) {
+        for line in lines {
+            tail.apply_line(line, stats);
+        }
+    }
+
+    fn assistant(
+        id: &str,
+        usage: serde_json::Value,
+        content: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-10-05T14:03:00Z",
+            "message": { "id": id, "model": "claude-opus-5-5", "usage": usage, "content": content }
+        })
+    }
+
+    #[test]
+    fn turns_record_what_triggered_them() {
+        let mut tail = SessionTail::new(PathBuf::from("/dev/null"));
+        let mut stats = Stats::default();
+        let usage = serde_json::json!({ "input_tokens": 10, "output_tokens": 5 });
+        feed(
+            &mut tail,
+            &mut stats,
+            &[
+                serde_json::json!({ "type": "user", "cwd": "/home/me/app", "message": { "content": "hi" } }),
+                assistant(
+                    "m1",
+                    usage.clone(),
+                    serde_json::json!([
+                        { "type": "tool_use", "id": "t1", "name": "Read" }
+                    ]),
+                ),
+                // A second content block of the same message must not consume the next trigger.
+                assistant("m1", usage.clone(), serde_json::json!([])),
+                serde_json::json!({ "type": "user", "timestamp": "2026-10-05T14:03:01Z",
+                "message": { "content": [ { "type": "tool_result", "tool_use_id": "t1" } ] } }),
+                assistant("m2", usage.clone(), serde_json::json!([])),
+                assistant("m3", usage.clone(), serde_json::json!([])),
+                serde_json::json!({ "type": "user", "isMeta": true, "message": { "content": "caveat" } }),
+                serde_json::json!({ "type": "system", "subtype": "compact_boundary" }),
+                assistant("m4", usage.clone(), serde_json::json!([])),
+            ],
+        );
+        let triggers: Vec<String> = stats
+            .turns
+            .iter()
+            .map(|t| stats.trigger_label(t.trigger))
+            .collect();
+        assert_eq!(
+            triggers,
+            [
+                "after user prompt",
+                "after Read",
+                "continuation",
+                "after compaction"
+            ]
+        );
+        assert_eq!(stats.cwd.as_deref(), Some("/home/me/app"));
+        assert!(stats.turns[0].at.is_some());
+    }
+
+    #[test]
+    fn costliest_ranks_turns_and_agents_with_their_driver() {
+        let prices = PriceTable::built_in();
+        let mut stats = Stats::default();
+        let model = stats.intern_model("claude-opus-5-5");
+        // Opus 5.5: 1M 1h cache writes = $8, 100k output = $2, 1M cache reads = $0.20.
+        stats.turns.push(TurnPoint {
+            cache_create: 1_000_000,
+            cache_create_1h: 1_000_000,
+            model,
+            ..Default::default()
+        });
+        stats.turns.push(TurnPoint {
+            output: 100_000,
+            model,
+            ..Default::default()
+        });
+        stats.turns.push(TurnPoint {
+            cache_read: 1_000_000,
+            model,
+            ..Default::default()
+        });
+        let mystery = stats.intern_model("mystery");
+        stats.turns.push(TurnPoint {
+            model: mystery,
+            input: 5,
+            ..Default::default()
+        });
+
+        let rows = costliest(&stats, &[3.0, 0.0], &prices, 3);
+        let items: Vec<Costly> = rows.iter().map(|r| r.0).collect();
+        assert_eq!(items, [Costly::Turn(0), Costly::Agent(0), Costly::Turn(1)]);
+        assert!((rows[0].1 - 8.0).abs() < 1e-9);
+
+        let drivers: Vec<Option<CostDriver>> = stats
+            .turns
+            .iter()
+            .map(|t| stats.cost_driver(t, &prices))
+            .collect();
+        assert_eq!(
+            drivers,
+            [
+                Some(CostDriver::CacheWrite),
+                Some(CostDriver::Output),
+                Some(CostDriver::CacheRead),
+                None
+            ]
+        );
+        assert_eq!(stats.main_model(), Some("claude-opus-5-5"));
     }
 }
