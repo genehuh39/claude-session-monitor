@@ -2,13 +2,14 @@
 
 A native desktop dashboard, built with [GPUI](https://www.gpui.rs/) (the UI framework behind Zed), that watches your Claude Code session live and charts token usage, cache behavior, and tool calls.
 
-It tails the most recently modified session transcript under `~/.claude/projects/*/*.jsonl`, so there is nothing to configure and no API access needed.
+It tails the most recently modified session transcript under `~/.claude/projects/*/*.jsonl`, so there is nothing to configure and no API key needed.
 
 ## What it shows
 
-- **Stat tiles:** uncached input, output, cache read, cache write, overall cache hit rate, turns, and tool calls.
+- **Stat tiles:** uncached input, output, cache read, cache write, overall cache hit rate, API cost, turns, and tool calls.
 - **Prompt size per turn:** stacked bars for the last 60 turns, split into cache read, cache write, and uncached input. Cache misses show up as large cache-write segments.
 - **Cache hit rate per turn:** one bar per turn, with a count of turns under 50%.
+- **Model:** the current model, how full its context window is, its API prices, the share of output spent on thinking, and fast-mode or US-only inference turns. If the session used more than one model, it lists turns and cost per model.
 - **Tool mix:** calls per tool (top 8), with average latency and error count on hover.
 - **Recent tool calls:** newest first, with a latency bar per call and errors flagged.
 
@@ -22,11 +23,22 @@ Each assistant entry in the transcript carries a `usage` object (`input_tokens`,
 - Tool latency is the time between a `tool_use` entry and its matching `tool_result`.
 - If a newer session file appears, the dashboard switches to it and resets.
 
+### API cost
+
+The cost tile shows what the session would cost at Claude API list prices (first-party API, standard tier). On a Pro or Max subscription you aren't billed this; it's what the same usage would cost on the API.
+
+- Each turn is priced by the model that handled it. Cache writes are billed at the 5-minute or 1-hour rate as logged, fast-mode turns at the fast-mode rate, and US-only inference at 1.1x.
+- Prices come from Anthropic's [pricing page](https://platform.claude.com/docs/en/about-claude/pricing), which the app fetches as Markdown on launch and again when the active session changes (at most once an hour). The parsed table is saved to `~/.cache/claude-session-monitor/pricing.json`.
+- If the fetch fails, the app uses the saved table, or a built-in table if there is none. The Model panel says which one it's using.
+- If a turn's model has no known price, it's left out and the tile reads **API COST (PARTIAL)**.
+- `cargo test -- --ignored` checks the live pricing page against the built-in table, which shows when the built-in prices need updating.
+
 ## Requirements
 
 - Rust (stable) and Cargo
-- macOS. GPUI also supports Linux and Windows, but this project has only been built and run on macOS.
+- macOS or Linux. It has been built and run on macOS, and on Fedora under WSL2 (WSLg).
 - On macOS, the Metal shader toolchain: `xcodebuild -downloadComponent MetalToolchain` (about 700MB, one-time)
+- On Linux, the xkbcommon development headers, plus Wayland, Vulkan and fontconfig libraries. On Fedora: `sudo dnf install libxkbcommon-devel libxkbcommon-x11-devel`
 
 ## Run
 
@@ -40,4 +52,6 @@ The first build compiles GPUI and its dependencies from source and takes a few m
 
 - `gpui` and `gpui_platform` are pinned to a specific commit of [zed-industries/zed](https://github.com/zed-industries/zed) in `Cargo.toml`, since GPUI's API changes frequently.
 - `gpui_platform` must be built with the `font-kit` feature. Without it, GPUI renders shapes but no text, and only logs a warning.
-- Only the single most recently modified session is followed. Cost estimates and a session picker are not implemented yet.
+- On Linux, `gpui_platform` also needs the `wayland` and `x11` features. Without them GPUI silently runs headless and no window opens.
+- When the compositor doesn't draw window decorations (for example WSLg), the app draws its own title bar for moving, maximizing and closing the window.
+- Only the single most recently modified session is followed. A session picker is not implemented yet.
