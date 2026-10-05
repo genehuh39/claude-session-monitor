@@ -2,13 +2,15 @@
 
 A native desktop dashboard, built with [GPUI](https://www.gpui.rs/) (the UI framework behind Zed), that watches your Claude Code session live and charts token usage, cache behavior, and tool calls.
 
-It tails the most recently modified session transcript under `~/.claude/projects/*/*.jsonl`, so there is nothing to configure and no API key needed.
+It follows the most recently active session transcript under `~/.claude/projects/*/*.jsonl`, so there is nothing to configure and no API key needed. You can also pick a session yourself.
 
 ## What it shows
 
-- **Stat tiles:** uncached input, output, cache read, cache write, overall cache hit rate, API cost, turns, and tool calls.
+- **Session header:** the project and session id, with a green dot while the session is being written to. Click it to open the session picker, which lists the 10 most recent sessions with their project, last activity and API cost. Picking one pins it; the badge next to the header switches between **FOLLOWING LATEST** and **PINNED**.
+- **Stat tiles:** uncached input, output, cache read, cache write, overall cache hit rate, API cost, turns, and tool calls. Token, hit-rate and cost tiles include subagents; the cost tile breaks the total into main conversation and agents (hover for each agent).
 - **Prompt size per turn:** stacked bars for the last 60 turns, split into cache read, cache write, and uncached input. Cache misses show up as large cache-write segments.
 - **Cache hit rate per turn:** one bar per turn, with a count of turns under 50%.
+- **Costliest turns:** the 5 most expensive API calls and subagent runs, with the model, the token category that drove the cost (bar colored to match the charts), and what the turn responded to: a user prompt, a tool result, or compaction. Hover a turn to mark it in both charts.
 - **Model:** the current model, how full its context window is, its API prices, the share of output spent on thinking, and fast-mode or US-only inference turns. If the session used more than one model, it lists turns and cost per model.
 - **Tool mix:** calls per tool (top 8), with average latency and error count on hover.
 - **Recent tool calls:** newest first, with a latency bar per call and errors flagged.
@@ -21,7 +23,8 @@ Each assistant entry in the transcript carries a `usage` object (`input_tokens`,
 
 - Claude Code logs each content block of one API message as a separate line with the same message id and usage, so messages are deduplicated by id.
 - Tool latency is the time between a `tool_use` entry and its matching `tool_result`.
-- If a newer session file appears, the dashboard switches to it and resets.
+- While following, the dashboard moves to a newer session only once the current one has been idle for a minute, so two sessions running side by side don't make it flip back and forth.
+- Subagent transcripts are read from `<session>/subagents/agent-*.jsonl`, with each agent's type and description from the matching `.meta.json`. The charts and tool panels show only the main conversation, since each subagent has its own context.
 
 ### API cost
 
@@ -54,4 +57,3 @@ The first build compiles GPUI and its dependencies from source and takes a few m
 - `gpui_platform` must be built with the `font-kit` feature. Without it, GPUI renders shapes but no text, and only logs a warning.
 - On Linux, `gpui_platform` also needs the `wayland` and `x11` features. Without them GPUI silently runs headless and no window opens.
 - When the compositor doesn't draw window decorations (for example WSLg), the app draws its own title bar for moving, maximizing and closing the window.
-- Only the single most recently modified session is followed. A session picker is not implemented yet.
