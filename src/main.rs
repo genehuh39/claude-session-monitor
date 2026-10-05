@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    AnyView, App, AppContext as _, Bounds, Context, SharedString, TitlebarOptions, Window,
-    WindowBounds, WindowOptions, div, prelude::*, px, relative, rgb, size, uniform_list,
+    AnyView, App, AppContext as _, Bounds, Context, Decorations, MouseButton, Pixels,
+    SharedString, Size, TitlebarOptions, Window, WindowBounds, WindowOptions, div, prelude::*, px,
+    relative, rgb, size, uniform_list,
 };
 use gpui_platform::application;
 use serde_json::Value;
@@ -15,6 +16,16 @@ use serde_json::Value;
 const MAX_RECENT_TOOL_CALLS: usize = 200;
 const CHART_TURNS: usize = 60;
 const PLOT_H: f64 = 120.0;
+
+// Window sizing: fill most of the screen, but never grow past the size the layout was designed for.
+const WINDOW_PREFERRED: (f32, f32) = (1200.0, 900.0);
+const WINDOW_MIN: (f32, f32) = (640.0, 420.0);
+const WINDOW_SCREEN_FRACTION: f32 = 0.85;
+// Used when the platform can't report a display at launch (e.g. Wayland, before the surface
+// enters an output); small enough for a 1280x800 laptop screen.
+const WINDOW_FALLBACK: (f32, f32) = (1000.0, 680.0);
+const WINDOW_TITLE: &str = "Claude Session Monitor";
+const TITLE_BAR_H: f32 = 32.0;
 
 // Validated dark palette (dataviz skill): surface #1a1a19, categorical slots 1-4.
 const PAGE: u32 = 0x0d0d0d;
@@ -295,7 +306,7 @@ struct SessionMonitor {
 }
 
 impl SessionMonitor {
-    fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
             session_path: None,
             tail: None,
@@ -316,6 +327,35 @@ impl SessionMonitor {
             }
         })
         .detach();
+
+        // Wayland only reports displays once the window is mapped, so the launch size may have
+        // been a guess. Resize to fit as soon as the display is known.
+        if !display_known_at_launch(cx) {
+            cx.spawn_in(window, async move |this, cx| {
+                for _ in 0..40 {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                    let fitted = this.update_in(cx, |_, window, cx| {
+                        let display = window
+                            .display(cx)
+                            .or_else(|| cx.displays().into_iter().next());
+                        let Some(display) = display else {
+                            return false;
+                        };
+                        let target = fit_window_to(display.visible_bounds().size);
+                        if window.bounds().size != target {
+                            window.resize(target);
+                        }
+                        true
+                    });
+                    if fitted.unwrap_or(true) {
+                        return;
+                    }
+                }
+            })
+            .detach();
+        }
 
         this
     }
@@ -640,7 +680,7 @@ fn tool_mix(stats: &Stats) -> impl IntoElement {
 }
 
 impl Render for SessionMonitor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let stats = &self.stats;
         let session_name = self
             .session_path
@@ -720,12 +760,11 @@ impl Render for SessionMonitor {
         // Chart D: recent tool calls with latency bars.
         let tool_count = stats.recent_tool_calls.len();
 
-        div()
-            .size_full()
+        let body = div()
+            .flex_1()
+            .min_h(px(0.0))
             .flex()
             .flex_col()
-            .bg(rgb(PAGE))
-            .text_color(rgb(INK))
             .p_4()
             .gap_3()
             .child(
@@ -897,18 +936,128 @@ impl Render for SessionMonitor {
                         .min_w(px(0.0))
                         .min_h(px(0.0)),
                     ),
-            )
+            );
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(PAGE))
+            .text_color(rgb(INK))
+            .children(title_bar(window))
+            .child(body)
     }
+}
+
+/// A draggable title bar, drawn only when the compositor leaves decorations to the app
+/// (e.g. WSLg/Weston). Drag to move, double-click to maximize, right-click for the window menu.
+fn title_bar(window: &Window) -> Option<impl IntoElement> {
+    if matches!(window.window_decorations(), Decorations::Server) {
+        return None;
+    }
+    let maximize_glyph = if window.is_maximized() { "❐" } else { "□" };
+    Some(
+        div()
+            .id("title-bar")
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .h(px(TITLE_BAR_H))
+            .flex_none()
+            .pl_4()
+            .bg(rgb(SURFACE))
+            .border_b_1()
+            .border_color(rgb(GRID))
+            .on_mouse_down(MouseButton::Left, |event, window, _| {
+                if event.click_count >= 2 {
+                    window.zoom_window();
+                } else {
+                    window.start_window_move();
+                }
+            })
+            .on_mouse_down(MouseButton::Right, |event, window, _| {
+                window.show_window_menu(event.position);
+            })
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(INK_2))
+                    .child(WINDOW_TITLE),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .h_full()
+                    .child(title_bar_button("minimize", "–", HOVER_WASH, |window, _| {
+                        window.minimize_window()
+                    }))
+                    .child(title_bar_button("maximize", maximize_glyph, HOVER_WASH, |window, _| {
+                        window.zoom_window()
+                    }))
+                    .child(title_bar_button("close", "×", CRITICAL, |window, _| {
+                        window.remove_window()
+                    })),
+            ),
+    )
+}
+
+fn title_bar_button(
+    id: &'static str,
+    glyph: &'static str,
+    hover_bg: u32,
+    action: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(44.0))
+        .h_full()
+        .text_sm()
+        .text_color(rgb(INK_2))
+        .hover(move |s| s.bg(rgb(hover_bg)).text_color(rgb(INK)))
+        // Keep the press from reaching the title bar, which would start a window move.
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(move |_, window, cx| action(window, cx))
+        .child(glyph)
+}
+
+fn display_known_at_launch(cx: &App) -> bool {
+    cx.primary_display().is_some() || !cx.displays().is_empty()
+}
+
+/// Largest window up to the preferred size that fits within `WINDOW_SCREEN_FRACTION` of the screen,
+/// without going below the minimum unless the screen itself is smaller.
+fn fit_window_to(visible: Size<Pixels>) -> Size<Pixels> {
+    let fit = |avail: Pixels, preferred: f32, min: f32| {
+        let avail = f32::from(avail);
+        px((avail * WINDOW_SCREEN_FRACTION).min(preferred).max(min.min(avail)))
+    };
+    size(
+        fit(visible.width, WINDOW_PREFERRED.0, WINDOW_MIN.0),
+        fit(visible.height, WINDOW_PREFERRED.1, WINDOW_MIN.1),
+    )
+}
+
+fn initial_window_size(cx: &App) -> Size<Pixels> {
+    cx.primary_display()
+        .or_else(|| cx.displays().into_iter().next())
+        .map(|display| fit_window_to(display.visible_bounds().size))
+        .unwrap_or_else(|| size(px(WINDOW_FALLBACK.0), px(WINDOW_FALLBACK.1)))
 }
 
 fn main() {
     application().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1200.0), px(900.0)), cx);
+        let bounds = Bounds::centered(None, initial_window_size(cx), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(WINDOW_MIN.0), px(WINDOW_MIN.1))),
                 titlebar: Some(TitlebarOptions {
-                    title: Some(SharedString::from("Claude Session Monitor")),
+                    title: Some(SharedString::from(WINDOW_TITLE)),
                     ..Default::default()
                 }),
                 ..Default::default()
