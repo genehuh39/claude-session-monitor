@@ -1,21 +1,25 @@
+mod pricing;
+
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    AnyView, App, AppContext as _, Bounds, Context, Decorations, MouseButton, Pixels,
-    SharedString, Size, TitlebarOptions, Window, WindowBounds, WindowOptions, div, prelude::*, px,
-    relative, rgb, size, uniform_list,
+    AnyView, App, AppContext as _, Bounds, Context, Decorations, MouseButton, MouseDownEvent,
+    MouseMoveEvent, Pixels, ScrollHandle, SharedString, Size, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, div, point, prelude::*, px, relative, rgb, size, uniform_list,
 };
 use gpui_platform::application;
+use pricing::{PriceSource, PriceTable, Usage};
 use serde_json::Value;
 
 const MAX_RECENT_TOOL_CALLS: usize = 200;
 const CHART_TURNS: usize = 60;
 const PLOT_H: f64 = 120.0;
+const PRICE_REFETCH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 // Window sizing: fill most of the screen, but never grow past the size the layout was designed for.
 const WINDOW_PREFERRED: (f32, f32) = (1200.0, 900.0);
@@ -26,6 +30,9 @@ const WINDOW_SCREEN_FRACTION: f32 = 0.85;
 const WINDOW_FALLBACK: (f32, f32) = (1000.0, 680.0);
 const WINDOW_TITLE: &str = "Claude Session Monitor";
 const TITLE_BAR_H: f32 = 32.0;
+const SCROLLBAR_W: f32 = 10.0;
+const SCROLLBAR_MIN_THUMB: f32 = 24.0;
+const BOTTOM_ROW_MIN_H: f32 = 320.0;
 
 // Validated dark palette (dataviz skill): surface #1a1a19, categorical slots 1-4.
 const PAGE: u32 = 0x0d0d0d;
@@ -42,51 +49,6 @@ const C_INPUT: u32 = 0x199e70;
 const C_OUTPUT: u32 = 0xc98500;
 const CRITICAL: u32 = 0xd03b3b;
 
-/// Claude API list prices in USD per million tokens (first-party API, standard tier).
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Rates {
-    input: f64,
-    output: f64,
-    cache_read: f64,
-}
-
-// Cache writes are billed as a multiple of the input rate, by TTL.
-const CACHE_WRITE_5M_MULT: f64 = 1.25;
-const CACHE_WRITE_1H_MULT: f64 = 2.0;
-// Fast mode (`usage.speed == "fast"`) bills at 2x the standard rates.
-const FAST_MODE_MULT: f64 = 2.0;
-
-// Prices as of 2026-10; update when Anthropic's pricing page changes.
-const MODEL_RATES: &[(&str, Rates)] = &[
-    ("claude-fable-5-1", Rates { input: 10.0, output: 50.0, cache_read: 0.25 }),
-    ("claude-mythos-5-1", Rates { input: 10.0, output: 50.0, cache_read: 0.25 }),
-    ("claude-fable-5", Rates { input: 10.0, output: 50.0, cache_read: 1.0 }),
-    ("claude-mythos-5", Rates { input: 10.0, output: 50.0, cache_read: 1.0 }),
-    ("claude-opus-5-5", Rates { input: 4.0, output: 20.0, cache_read: 0.20 }),
-    ("claude-opus-5", Rates { input: 5.0, output: 25.0, cache_read: 0.50 }),
-    ("claude-opus-4-8", Rates { input: 5.0, output: 25.0, cache_read: 0.50 }),
-    ("claude-opus-4-7", Rates { input: 5.0, output: 25.0, cache_read: 0.50 }),
-    ("claude-opus-4-6", Rates { input: 5.0, output: 25.0, cache_read: 0.50 }),
-    ("claude-sonnet-5-5", Rates { input: 2.0, output: 10.0, cache_read: 0.20 }),
-    ("claude-sonnet-5", Rates { input: 2.0, output: 10.0, cache_read: 0.20 }),
-    ("claude-sonnet-4-6", Rates { input: 3.0, output: 15.0, cache_read: 0.30 }),
-    ("claude-haiku-4-5", Rates { input: 1.0, output: 5.0, cache_read: 0.10 }),
-];
-
-/// Looks up rates for a model id, tolerating provider prefixes (`us.anthropic.`) and
-/// date-pinned snapshots (`claude-haiku-4-5-20251001`).
-fn rates_for_model(model: &str) -> Option<Rates> {
-    let model = model.rsplit("anthropic.").next().unwrap_or(model);
-    let base = match model.rsplit_once('-') {
-        Some((head, tail)) if tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit()) => head,
-        _ => model,
-    };
-    MODEL_RATES
-        .iter()
-        .find(|(id, _)| *id == base)
-        .map(|(_, rates)| *rates)
-}
-
 #[derive(Clone, Copy, Default)]
 struct TurnPoint {
     input: u64,
@@ -95,9 +57,12 @@ struct TurnPoint {
     cache_create: u64,
     /// Portion of `cache_create` written with the 1-hour TTL (the rest is 5-minute).
     cache_create_1h: u64,
-    /// None when the model has no known price; such turns are excluded from cost totals.
-    rates: Option<Rates>,
+    /// Portion of `output` spent on thinking.
+    thinking: u64,
+    /// Index into `Stats::models`.
+    model: Option<u16>,
     fast: bool,
+    us_geo: bool,
 }
 
 impl TurnPoint {
@@ -120,22 +85,23 @@ impl TurnPoint {
         self.cache_read = self.cache_read.max(other.cache_read);
         self.cache_create = self.cache_create.max(other.cache_create);
         self.cache_create_1h = self.cache_create_1h.max(other.cache_create_1h);
-        self.rates = self.rates.or(other.rates);
+        self.thinking = self.thinking.max(other.thinking);
+        self.model = self.model.or(other.model);
         self.fast |= other.fast;
+        self.us_geo |= other.us_geo;
     }
 
-    /// What this turn would cost at Claude API list prices, in USD.
-    fn cost_usd(&self) -> Option<f64> {
-        let r = self.rates?;
+    fn usage(&self) -> Usage {
         let write_1h = self.cache_create_1h.min(self.cache_create);
-        let write_5m = self.cache_create - write_1h;
-        let per_mtok = self.input as f64 * r.input
-            + self.output as f64 * r.output
-            + self.cache_read as f64 * r.cache_read
-            + write_5m as f64 * r.input * CACHE_WRITE_5M_MULT
-            + write_1h as f64 * r.input * CACHE_WRITE_1H_MULT;
-        let speed = if self.fast { FAST_MODE_MULT } else { 1.0 };
-        Some(per_mtok / 1_000_000.0 * speed)
+        Usage {
+            input: self.input,
+            output: self.output,
+            cache_read: self.cache_read,
+            cache_write_5m: self.cache_create - write_1h,
+            cache_write_1h: write_1h,
+            fast: self.fast,
+            us_geo: self.us_geo,
+        }
     }
 }
 
@@ -154,10 +120,18 @@ struct ToolCallEntry {
     is_error: bool,
 }
 
+struct ModelMixRow {
+    model: String,
+    turns: usize,
+    cost: Option<f64>,
+}
+
 #[derive(Default)]
 struct Stats {
     turns: Vec<TurnPoint>,
     turn_index: HashMap<String, usize>,
+    /// Distinct model ids seen this session, referenced by `TurnPoint::model`.
+    models: Vec<String>,
     tools: HashMap<String, ToolAgg>,
     recent_tool_calls: VecDeque<ToolCallEntry>,
 }
@@ -177,12 +151,77 @@ impl Stats {
         }
     }
 
-    fn total_cost_usd(&self) -> f64 {
-        self.turns.iter().filter_map(TurnPoint::cost_usd).sum()
+    fn intern_model(&mut self, model: &str) -> Option<u16> {
+        // Claude Code logs locally generated messages (e.g. errors) as "<synthetic>".
+        if model.is_empty() || model.starts_with('<') {
+            return None;
+        }
+        let ix = match self.models.iter().position(|m| m == model) {
+            Some(ix) => ix,
+            None => {
+                self.models.push(model.to_string());
+                self.models.len() - 1
+            }
+        };
+        u16::try_from(ix).ok()
     }
 
-    fn unpriced_turns(&self) -> usize {
-        self.turns.iter().filter(|t| t.rates.is_none()).count()
+    fn model_of(&self, turn: &TurnPoint) -> Option<&str> {
+        turn.model
+            .and_then(|ix| self.models.get(ix as usize))
+            .map(String::as_str)
+    }
+
+    /// What this turn would cost at Claude API list prices, in USD.
+    fn turn_cost(&self, turn: &TurnPoint, prices: &PriceTable) -> Option<f64> {
+        let price = prices.lookup(self.model_of(turn)?)?;
+        Some(price.cost_usd(&turn.usage()))
+    }
+
+    fn total_cost_usd(&self, prices: &PriceTable) -> f64 {
+        self.turns
+            .iter()
+            .filter_map(|t| self.turn_cost(t, prices))
+            .sum()
+    }
+
+    /// Turns that used tokens but whose model has no known price.
+    fn unpriced_turns(&self, prices: &PriceTable) -> usize {
+        self.turns
+            .iter()
+            .filter(|t| t.prompt_total() + t.output > 0 && self.turn_cost(t, prices).is_none())
+            .count()
+    }
+
+    /// The most recent turn that names a model.
+    fn current_turn(&self) -> Option<&TurnPoint> {
+        self.turns.iter().rev().find(|t| t.model.is_some())
+    }
+
+    /// Turns and cost per model, most-used first.
+    fn model_mix(&self, prices: &PriceTable) -> Vec<ModelMixRow> {
+        let mut rows: Vec<ModelMixRow> = self
+            .models
+            .iter()
+            .enumerate()
+            .map(|(ix, model)| {
+                let turns: Vec<&TurnPoint> = self
+                    .turns
+                    .iter()
+                    .filter(|t| t.model == Some(ix as u16))
+                    .collect();
+                let cost = prices.lookup(model).map(|price| {
+                    turns.iter().map(|t| price.cost_usd(&t.usage())).sum()
+                });
+                ModelMixRow {
+                    model: model.clone(),
+                    turns: turns.len(),
+                    cost,
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| b.turns.cmp(&a.turns).then(a.model.cmp(&b.model)));
+        rows
     }
 
     fn total_tool_calls(&self) -> u64 {
@@ -299,8 +338,13 @@ impl SessionTail {
                             .get("cache_creation")
                             .map(|c| get(c, "ephemeral_1h_input_tokens"))
                             .unwrap_or(0),
-                        rates: rates_for_model(model),
+                        thinking: usage
+                            .get("output_tokens_details")
+                            .map(|d| get(d, "thinking_tokens"))
+                            .unwrap_or(0),
+                        model: stats.intern_model(model),
                         fast: usage.get("speed").and_then(Value::as_str) == Some("fast"),
+                        us_geo: usage.get("inference_geo").and_then(Value::as_str) == Some("us"),
                     };
                     // Claude Code logs each content block of one API message as its own line,
                     // all carrying the same message id and usage; count each message once.
@@ -384,27 +428,50 @@ impl SessionTail {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ScrollbarDrag {
+    start_mouse_y: f32,
+    start_scroll_y: f32,
+    /// Content pixels scrolled per pixel of thumb movement.
+    content_per_track_px: f32,
+}
+
 struct SessionMonitor {
+    body_scroll: ScrollHandle,
+    scrollbar_drag: Option<ScrollbarDrag>,
     session_path: Option<PathBuf>,
     tail: Option<SessionTail>,
     stats: Stats,
+    prices: PriceTable,
+    last_price_fetch: Option<Instant>,
+    price_fetch_in_flight: bool,
+    price_fetch_error: Option<String>,
 }
 
 impl SessionMonitor {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
+            body_scroll: ScrollHandle::new(),
+            scrollbar_drag: None,
             session_path: None,
             tail: None,
             stats: Stats::default(),
+            prices: PriceTable::load(),
+            last_price_fetch: None,
+            price_fetch_in_flight: false,
+            price_fetch_error: None,
         };
         this.refresh();
+        this.refresh_prices(cx);
 
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
                 .timer(Duration::from_millis(750))
                 .await;
             let result = this.update(cx, |this, cx| {
-                this.refresh();
+                if this.refresh() {
+                    this.refresh_prices(cx);
+                }
                 cx.notify();
             });
             if result.is_err() {
@@ -445,21 +512,79 @@ impl SessionMonitor {
         this
     }
 
-    fn rescan(&mut self) {
+    /// Switches to the most recently active session; returns whether it changed.
+    fn rescan(&mut self) -> bool {
         if let Some(path) = find_active_session() {
             if self.session_path.as_ref() != Some(&path) {
                 self.session_path = Some(path.clone());
                 self.tail = Some(SessionTail::new(path));
                 self.stats = Stats::default();
+                return true;
             }
         }
+        false
     }
 
-    fn refresh(&mut self) {
-        self.rescan();
+    /// Returns whether the active session changed.
+    fn refresh(&mut self) -> bool {
+        let switched = self.rescan();
         if let Some(tail) = &mut self.tail {
             let _ = tail.poll(&mut self.stats);
         }
+        switched
+    }
+
+    fn price_source_label(&self) -> String {
+        let base = match self.prices.source {
+            PriceSource::Live { fetched_at } => {
+                return format!("live API prices, fetched {}", format_ago(fetched_at));
+            }
+            PriceSource::Cached { fetched_at } => {
+                format!("cached API prices from {}", format_ago(fetched_at))
+            }
+            PriceSource::BuiltIn => "built-in API prices (Oct 2026)".to_string(),
+        };
+        if self.price_fetch_in_flight {
+            format!("{base}, updating")
+        } else if self.price_fetch_error.is_some() {
+            format!("{base}, offline")
+        } else {
+            base
+        }
+    }
+
+    /// Fetches the live pricing page in the background, at most once per
+    /// `PRICE_REFETCH_INTERVAL`; on failure the current (cached or built-in) prices stay.
+    fn refresh_prices(&mut self, cx: &mut Context<Self>) {
+        let due = self
+            .last_price_fetch
+            .is_none_or(|at| at.elapsed() >= PRICE_REFETCH_INTERVAL);
+        if self.price_fetch_in_flight || !due {
+            return;
+        }
+        self.price_fetch_in_flight = true;
+        self.last_price_fetch = Some(Instant::now());
+        let fetch = cx.background_executor().spawn(async {
+            let table = PriceTable::fetch()?;
+            // A failed cache write only costs the next offline launch its fresh prices.
+            let _ = table.save_cache();
+            anyhow::Ok(table)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = fetch.await;
+            this.update(cx, |this, cx| {
+                this.price_fetch_in_flight = false;
+                match result {
+                    Ok(table) => {
+                        this.prices = table;
+                        this.price_fetch_error = None;
+                    }
+                    Err(err) => this.price_fetch_error = Some(format!("{err:#}")),
+                }
+                cx.notify();
+            })
+        })
+        .detach();
     }
 }
 
@@ -518,7 +643,13 @@ fn stat_tile(label: &str, value: String, swatch: Option<u32>) -> impl IntoElemen
 }
 
 fn legend(items: &[(&str, u32)]) -> impl IntoElement {
-    let mut row = div().flex().flex_row().gap_3().items_center();
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .gap_x_3()
+        .gap_y_1()
+        .items_center();
     for (label, color) in items {
         row = row.child(
             div()
@@ -544,11 +675,15 @@ fn chart_card(
     legend_items: Option<&[(&str, u32)]>,
     body: impl IntoElement,
 ) -> gpui::Div {
+    // Wraps so a narrow card moves the legend under the title instead of overflowing.
     let mut header = div()
         .flex()
         .flex_row()
+        .flex_wrap()
         .justify_between()
         .items_start()
+        .gap_x_4()
+        .gap_y_2()
         .child(
             div()
                 .flex()
@@ -575,6 +710,9 @@ fn chart_card(
         .rounded_md()
         .border_1()
         .border_color(rgb(GRID))
+        // Anything that still doesn't fit is clipped to the card rather than drawn over its
+        // neighbors.
+        .overflow_hidden()
         .child(header)
         .child(body)
 }
@@ -705,6 +843,138 @@ fn format_usd(amount: f64) -> String {
     }
 }
 
+fn format_ago(at: DateTime<Utc>) -> String {
+    let secs = (Utc::now() - at).num_seconds().max(0);
+    match secs {
+        0..60 => "just now".to_string(),
+        60..3600 => format!("{}m ago", secs / 60),
+        3600..86400 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86400),
+    }
+}
+
+fn format_rate(per_mtok: f64) -> String {
+    if per_mtok.fract() == 0.0 {
+        format!("${per_mtok:.0}")
+    } else {
+        format!("${per_mtok:.2}")
+    }
+}
+
+fn model_panel(stats: &Stats, prices: &PriceTable) -> impl IntoElement {
+    let muted = |text: String| div().text_xs().text_color(rgb(MUTED)).child(text);
+    let Some(current) = stats.current_turn() else {
+        return div().child(muted("no model activity yet".to_string()));
+    };
+    let model = stats.model_of(current).unwrap_or_default();
+    let price = prices.lookup(model);
+    let display = |id: &str| prices.lookup(id).map_or_else(|| id.to_string(), |p| p.name.clone());
+
+    let mut panel = div().flex().flex_col().gap_3().child(
+        div()
+            .flex()
+            .flex_col()
+            .child(div().text_lg().text_color(rgb(INK)).child(display(model)))
+            .child(muted(model.to_string())),
+    );
+
+    // Context: the latest prompt is everything the model had to read on its last turn.
+    let used = current.prompt_total();
+    let context = match pricing::context_window(model) {
+        Some(window) => {
+            let frac = (used as f32 / window as f32).clamp(0.0, 1.0);
+            let color = match frac {
+                f if f >= 0.9 => CRITICAL,
+                f if f >= 0.75 => C_OUTPUT,
+                _ => C_READ,
+            };
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_between()
+                        .child(muted("Context".to_string()))
+                        .child(div().text_xs().text_color(rgb(INK_2)).child(format!(
+                            "{} / {} ({:.0}%)",
+                            format_tokens(used),
+                            format_tokens(window),
+                            frac * 100.0
+                        ))),
+                )
+                .child(
+                    div()
+                        .h(px(8.0))
+                        .w_full()
+                        .bg(rgb(GRID))
+                        .rounded_sm()
+                        .child(div().h_full().w(relative(frac)).bg(rgb(color)).rounded_sm()),
+                )
+        }
+        None => div().child(muted(format!("Context {} (window unknown)", format_tokens(used)))),
+    };
+    panel = panel.child(context);
+
+    let mut details = div().flex().flex_col().gap_1();
+    details = details.child(muted(match price {
+        Some(p) => format!(
+            "{} in, {} out, {} cache read per MTok",
+            format_rate(p.input),
+            format_rate(p.output),
+            format_rate(p.cache_read)
+        ),
+        None => "no API price for this model".to_string(),
+    }));
+    let output = stats.sum(|t| t.output);
+    let thinking = stats.sum(|t| t.thinking);
+    if output > 0 {
+        details = details.child(muted(format!(
+            "Thinking {} of {} output ({:.0}%)",
+            format_tokens(thinking),
+            format_tokens(output),
+            thinking as f64 / output as f64 * 100.0
+        )));
+    }
+    let fast = stats.turns.iter().filter(|t| t.fast).count();
+    if fast > 0 {
+        details = details.child(muted(format!("Fast mode on {fast} turns")));
+    }
+    let us_geo = stats.turns.iter().filter(|t| t.us_geo).count();
+    if us_geo > 0 {
+        details = details.child(muted(format!("US-only inference on {us_geo} turns (1.1x)")));
+    }
+    panel = panel.child(details);
+
+    let mix = stats.model_mix(prices);
+    if mix.len() > 1 {
+        let mut rows = div().flex().flex_col().gap_1().child(muted("Model mix".to_string()));
+        for row in mix {
+            rows = rows.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .text_xs()
+                    .child(div().flex_1().text_color(rgb(INK_2)).child(display(&row.model)))
+                    .child(div().text_color(rgb(MUTED)).child(format!("{} turns", row.turns)))
+                    .child(
+                        div()
+                            .w(px(64.0))
+                            .flex()
+                            .justify_end()
+                            .text_color(rgb(INK))
+                            .child(row.cost.map_or_else(|| "-".to_string(), format_usd)),
+                    ),
+            );
+        }
+        panel = panel.child(rows);
+    }
+    panel
+}
+
 fn tool_mix(stats: &Stats) -> impl IntoElement {
     let mut rows: Vec<(&String, &ToolAgg)> = stats.tools.iter().collect();
     rows.sort_by(|a, b| b.1.count.cmp(&a.1.count).then(a.0.cmp(b.0)));
@@ -775,6 +1045,7 @@ fn tool_mix(stats: &Stats) -> impl IntoElement {
 impl Render for SessionMonitor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let stats = &self.stats;
+        let prices = &self.prices;
         let session_name = self
             .session_path
             .as_ref()
@@ -813,7 +1084,7 @@ impl Render for SessionMonitor {
                     format!("Uncached input {}", format_tokens(t.input)),
                     format!("Output {}", format_tokens(t.output)),
                     format!("Hit rate {:.0}%", t.hit_rate()),
-                    match t.cost_usd() {
+                    match stats.turn_cost(t, prices) {
                         Some(cost) => format!("Cost {}", format_usd(cost)),
                         None => "Cost unknown (unpriced model)".to_string(),
                     },
@@ -858,11 +1129,14 @@ impl Render for SessionMonitor {
         let tool_count = stats.recent_tool_calls.len();
 
         let body = div()
-            .flex_1()
-            .min_h(px(0.0))
+            .id("dashboard")
+            .size_full()
+            .overflow_y_scroll()
+            .track_scroll(&self.body_scroll)
             .flex()
             .flex_col()
             .p_4()
+            .pr(px(SCROLLBAR_W + 8.0))
             .gap_3()
             .child(
                 div()
@@ -902,8 +1176,12 @@ impl Render for SessionMonitor {
                         None,
                     ))
                     .child(stat_tile(
-                        if stats.unpriced_turns() > 0 { "API COST (PARTIAL)" } else { "API COST" },
-                        format_usd(stats.total_cost_usd()),
+                        if stats.unpriced_turns(prices) > 0 {
+                            "API COST (PARTIAL)"
+                        } else {
+                            "API COST"
+                        },
+                        format_usd(stats.total_cost_usd(prices)),
                         None,
                     ))
                     .child(stat_tile("TURNS", n_turns.to_string(), None))
@@ -949,7 +1227,17 @@ impl Render for SessionMonitor {
                     .flex_row()
                     .gap_3()
                     .flex_1()
-                    .min_h(px(0.0))
+                    // Below this the tool lists are too short to read; scroll instead.
+                    .min_h(px(BOTTOM_ROW_MIN_H))
+                    .child(
+                        chart_card(
+                            "Model",
+                            self.price_source_label(),
+                            None,
+                            model_panel(stats, prices),
+                        )
+                        .w(px(300.0)),
+                    )
                     .child(
                         chart_card(
                             "Tool mix",
@@ -957,7 +1245,7 @@ impl Render for SessionMonitor {
                             None,
                             tool_mix(stats),
                         )
-                        .w(px(380.0)),
+                        .w(px(340.0)),
                     )
                     .child(
                         chart_card(
@@ -1047,7 +1335,107 @@ impl Render for SessionMonitor {
             .bg(rgb(PAGE))
             .text_color(rgb(INK))
             .children(title_bar(window))
-            .child(body)
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .child(body)
+                    .children(self.scrollbar(cx)),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                let Some(drag) = this.scrollbar_drag else {
+                    return;
+                };
+                if event.pressed_button != Some(MouseButton::Left) {
+                    this.scrollbar_drag = None;
+                    return;
+                }
+                let delta = f32::from(event.position.y) - drag.start_mouse_y;
+                this.set_scroll_y(drag.start_scroll_y + delta * drag.content_per_track_px);
+                cx.notify();
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.scrollbar_drag = None),
+            )
+    }
+}
+
+impl SessionMonitor {
+    fn set_scroll_y(&self, y: f32) {
+        let max = f32::from(self.body_scroll.max_offset().y);
+        let offset = self.body_scroll.offset();
+        self.body_scroll
+            .set_offset(point(offset.x, px(-y.clamp(0.0, max.max(0.0)))));
+    }
+
+    /// GPUI scroll containers don't paint a scrollbar, so draw one over the dashboard's right
+    /// edge: drag the thumb, or click the track to jump there.
+    fn scrollbar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let viewport = self.body_scroll.bounds();
+        let view_h = f32::from(viewport.size.height);
+        let max = f32::from(self.body_scroll.max_offset().y);
+        if max <= 0.5 || view_h <= 0.0 {
+            return None;
+        }
+        let scrolled = -f32::from(self.body_scroll.offset().y);
+        let thumb_h = (view_h * view_h / (view_h + max)).max(SCROLLBAR_MIN_THUMB);
+        let travel = (view_h - thumb_h).max(1.0);
+        let thumb_top = scrolled / max * travel;
+        let content_per_track_px = max / travel;
+        let dragging = self.scrollbar_drag.is_some();
+        let track_top = f32::from(viewport.origin.y);
+
+        Some(
+            div()
+                .id("scrollbar-track")
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .right_0()
+                .w(px(SCROLLBAR_W))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        // Center the thumb on the click, then let the press keep dragging.
+                        let click = f32::from(event.position.y) - track_top;
+                        let target = (click - thumb_h / 2.0) * content_per_track_px;
+                        this.set_scroll_y(target);
+                        this.scrollbar_drag = Some(ScrollbarDrag {
+                            start_mouse_y: f32::from(event.position.y),
+                            start_scroll_y: target.clamp(0.0, max),
+                            content_per_track_px,
+                        });
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .id("scrollbar-thumb")
+                        .absolute()
+                        .top(px(thumb_top))
+                        .right(px(2.0))
+                        .w(px(SCROLLBAR_W - 4.0))
+                        .h(px(thumb_h))
+                        .rounded_full()
+                        .bg(rgb(if dragging { MUTED } else { BASELINE }))
+                        .hover(|s| s.bg(rgb(MUTED)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                this.scrollbar_drag = Some(ScrollbarDrag {
+                                    start_mouse_y: f32::from(event.position.y),
+                                    start_scroll_y: scrolled,
+                                    content_per_track_px,
+                                });
+                                cx.stop_propagation();
+                                cx.notify();
+                            }),
+                        ),
+                ),
+        )
     }
 }
 
@@ -1175,34 +1563,35 @@ fn main() {
 mod tests {
     use super::*;
 
-    #[test]
-    fn rates_lookup_handles_prefixes_and_snapshots() {
-        let opus = rates_for_model("claude-opus-5-5").unwrap();
-        assert_eq!(opus.input, 4.0);
-        assert_eq!(rates_for_model("us.anthropic.claude-opus-5-5"), Some(opus));
-        assert_eq!(rates_for_model("claude-haiku-4-5-20251001").unwrap().input, 1.0);
-        // "claude-opus-5" must not swallow "claude-opus-5-5" or vice versa.
-        assert_eq!(rates_for_model("claude-opus-5").unwrap().input, 5.0);
-        assert_eq!(rates_for_model("<synthetic>"), None);
-        assert_eq!(rates_for_model("opus"), None);
+    fn turn(stats: &mut Stats, model: &str, input: u64) -> TurnPoint {
+        TurnPoint {
+            input,
+            model: stats.intern_model(model),
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn turn_cost_splits_cache_writes_by_ttl() {
-        let turn = TurnPoint {
-            input: 1_000_000,
-            output: 1_000_000,
-            cache_read: 1_000_000,
-            cache_create: 2_000_000,
-            cache_create_1h: 1_000_000,
-            rates: rates_for_model("claude-opus-5-5"),
-            fast: false,
-        };
-        // 4 input + 20 output + 0.20 read + 5 (5m write) + 8 (1h write)
-        assert!((turn.cost_usd().unwrap() - 37.20).abs() < 1e-9);
-        let fast = TurnPoint { fast: true, ..turn };
-        assert!((fast.cost_usd().unwrap() - 74.40).abs() < 1e-9);
-        let unknown = TurnPoint { rates: None, ..turn };
-        assert_eq!(unknown.cost_usd(), None);
+    fn model_mix_and_unpriced_turns() {
+        let prices = PriceTable::built_in();
+        let mut stats = Stats::default();
+        for t in [
+            turn(&mut stats, "claude-opus-5-5", 1_000_000),
+            turn(&mut stats, "claude-opus-5-5", 1_000_000),
+            turn(&mut stats, "claude-sonnet-5-5", 1_000_000),
+            turn(&mut stats, "mystery-model", 10),
+            // Synthetic, token-free turns are neither a model nor unpriced.
+            turn(&mut stats, "<synthetic>", 0),
+        ] {
+            stats.turns.push(t);
+        }
+        assert_eq!(stats.models, ["claude-opus-5-5", "claude-sonnet-5-5", "mystery-model"]);
+        assert!((stats.total_cost_usd(&prices) - 10.0).abs() < 1e-9);
+        assert_eq!(stats.unpriced_turns(&prices), 1);
+        let mix = stats.model_mix(&prices);
+        assert_eq!((mix[0].model.as_str(), mix[0].turns), ("claude-opus-5-5", 2));
+        assert!((mix[0].cost.unwrap() - 8.0).abs() < 1e-9);
+        assert_eq!(mix.iter().find(|r| r.model == "mystery-model").unwrap().cost, None);
+        assert_eq!(stats.model_of(stats.current_turn().unwrap()), Some("mystery-model"));
     }
 }
