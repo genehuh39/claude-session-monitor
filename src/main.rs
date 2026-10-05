@@ -265,8 +265,8 @@ impl Stats {
         }
     }
 
-    /// The token category that contributed most to a turn's cost.
-    fn cost_driver(&self, turn: &TurnPoint, prices: &PriceTable) -> Option<CostDriver> {
+    /// A turn's cost split by token category, in `CostDriver::ALL` order.
+    fn category_costs(&self, turn: &TurnPoint, prices: &PriceTable) -> Option<[f64; 4]> {
         let price = prices.lookup(self.model_of(turn)?)?;
         let u = turn.usage();
         let only = |f: &dyn Fn(&mut Usage)| {
@@ -278,25 +278,46 @@ impl Stats {
             f(&mut part);
             price.cost_usd(&part)
         };
-        [
-            (
-                CostDriver::CacheWrite,
-                only(&|p| {
-                    p.cache_write_5m = u.cache_write_5m;
-                    p.cache_write_1h = u.cache_write_1h;
-                }),
-            ),
-            (CostDriver::Output, only(&|p| p.output = u.output)),
-            (CostDriver::Input, only(&|p| p.input = u.input)),
-            (
-                CostDriver::CacheRead,
-                only(&|p| p.cache_read = u.cache_read),
-            ),
-        ]
-        .into_iter()
-        .max_by(|a, b| a.1.total_cmp(&b.1))
-        .filter(|(_, cost)| *cost > 0.0)
-        .map(|(driver, _)| driver)
+        Some(CostDriver::ALL.map(|driver| match driver {
+            CostDriver::CacheWrite => only(&|p| {
+                p.cache_write_5m = u.cache_write_5m;
+                p.cache_write_1h = u.cache_write_1h;
+            }),
+            CostDriver::Output => only(&|p| p.output = u.output),
+            CostDriver::Input => only(&|p| p.input = u.input),
+            CostDriver::CacheRead => only(&|p| p.cache_read = u.cache_read),
+        }))
+    }
+
+    /// The token category that contributed most to a turn's cost.
+    fn cost_driver(&self, turn: &TurnPoint, prices: &PriceTable) -> Option<CostDriver> {
+        CostDriver::largest(self.category_costs(turn, prices)?)
+    }
+
+    /// The token category that contributed most to the cost of all turns together.
+    fn run_cost_driver(&self, prices: &PriceTable) -> Option<CostDriver> {
+        let mut total = [0.0; 4];
+        for costs in self
+            .turns
+            .iter()
+            .filter_map(|t| self.category_costs(t, prices))
+        {
+            for (sum, cost) in total.iter_mut().zip(costs) {
+                *sum += cost;
+            }
+        }
+        CostDriver::largest(total)
+    }
+
+    /// Token counts summed over all turns, for describing a whole run.
+    fn token_totals(&self) -> TurnPoint {
+        TurnPoint {
+            input: self.sum(|t| t.input),
+            output: self.sum(|t| t.output),
+            cache_read: self.sum(|t| t.cache_read),
+            cache_create: self.sum(|t| t.cache_create),
+            ..Default::default()
+        }
     }
 
     /// The model used on most turns.
@@ -319,6 +340,22 @@ enum CostDriver {
 }
 
 impl CostDriver {
+    const ALL: [CostDriver; 4] = [
+        CostDriver::CacheWrite,
+        CostDriver::Output,
+        CostDriver::Input,
+        CostDriver::CacheRead,
+    ];
+
+    fn largest(costs: [f64; 4]) -> Option<CostDriver> {
+        Self::ALL
+            .into_iter()
+            .zip(costs)
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .filter(|(_, cost)| *cost > 0.0)
+            .map(|(driver, _)| driver)
+    }
+
     fn color(self) -> u32 {
         match self {
             CostDriver::CacheWrite => C_WRITE,
@@ -559,6 +596,9 @@ struct SessionMonitor {
     picker_sessions: Vec<SessionFile>,
     summaries: HashMap<PathBuf, SessionSummary>,
     summaries_in_flight: bool,
+    /// Bumped whenever `prices` is replaced, so summaries priced with an older table are
+    /// dropped.
+    price_generation: u64,
     prices: PriceTable,
     last_price_fetch: Option<Instant>,
     price_fetch_in_flight: bool,
@@ -582,6 +622,7 @@ impl SessionMonitor {
             picker_sessions: Vec::new(),
             summaries: HashMap::new(),
             summaries_in_flight: false,
+            price_generation: 0,
             prices: PriceTable::load(),
             last_price_fetch: None,
             price_fetch_in_flight: false,
@@ -639,7 +680,7 @@ impl SessionMonitor {
     }
 
     fn open_session(&mut self, path: PathBuf) {
-        self.session_modified = sessions::modified(&path);
+        self.session_modified = sessions::last_activity(&path);
         self.session_path = Some(path.clone());
         self.tail = Some(SessionTail::new(path));
         self.stats = Stats::default();
@@ -658,7 +699,9 @@ impl SessionMonitor {
         };
         let follow = sessions::should_follow(
             self.session_path.as_deref(),
-            self.session_path.as_deref().and_then(sessions::modified),
+            self.session_path
+                .as_deref()
+                .and_then(sessions::last_activity),
             &newest.path,
             SystemTime::now(),
         );
@@ -676,7 +719,7 @@ impl SessionMonitor {
             let _ = tail.poll(&mut self.stats);
         }
         if let Some(path) = &self.session_path {
-            self.session_modified = sessions::modified(path);
+            self.session_modified = sessions::last_activity(path);
             sessions::sync_agents(path, &mut self.agents);
         }
         switched
@@ -727,7 +770,7 @@ impl SessionMonitor {
             .filter(|s| {
                 self.summaries
                     .get(&s.path)
-                    .is_none_or(|sum| sum.len != sessions::file_len(&s.path))
+                    .is_none_or(|sum| sum.fingerprint != sessions::fingerprint(&s.path))
             })
             .map(|s| s.path.clone())
             .collect();
@@ -736,6 +779,7 @@ impl SessionMonitor {
         }
         self.summaries_in_flight = true;
         let prices = self.prices.clone();
+        let generation = self.price_generation;
         let task = cx.background_executor().spawn(async move {
             stale
                 .into_iter()
@@ -749,7 +793,12 @@ impl SessionMonitor {
             let results = task.await;
             this.update(cx, |this, cx| {
                 this.summaries_in_flight = false;
-                this.summaries.extend(results);
+                if generation == this.price_generation {
+                    this.summaries.extend(results);
+                } else if this.picker_open {
+                    // Prices changed mid-flight; redo the picker's sessions with the new table.
+                    this.summarize_picker_sessions(cx);
+                }
                 cx.notify();
             })
         })
@@ -799,6 +848,11 @@ impl SessionMonitor {
                 match result {
                     Ok(table) => {
                         this.prices = table;
+                        this.price_generation += 1;
+                        this.summaries.clear();
+                        if this.picker_open {
+                            this.summarize_picker_sessions(cx);
+                        }
                         this.price_fetch_error = None;
                     }
                     Err(err) => this.price_fetch_error = Some(format!("{err:#}")),
@@ -2059,6 +2113,8 @@ impl SessionMonitor {
                         tip.push(description.clone());
                     }
                     let started = agent.stats.turns.first().and_then(|t| t.at);
+                    let driver = agent.stats.run_cost_driver(prices);
+                    let tokens = agent.stats.token_totals();
                     row.tooltip(tip_builder(tip))
                         .child(cell(44.0).text_color(rgb(MUTED)).child("⤷ agent"))
                         .child(
@@ -2066,7 +2122,7 @@ impl SessionMonitor {
                                 .text_color(rgb(MUTED))
                                 .child(local_time(started, "%H:%M")),
                         )
-                        .child(bar(MUTED))
+                        .child(bar(driver.map_or(MUTED, CostDriver::color)))
                         .child(cost_cell)
                         .child(
                             cell(88.0)
@@ -2076,10 +2132,11 @@ impl SessionMonitor {
                         .child(
                             cell(130.0)
                                 .text_color(rgb(INK_2))
-                                .child(agent.label().to_string()),
+                                .child(driver.map_or_else(String::new, |d| d.describe(&tokens))),
                         )
                         .child(cell(150.0).text_color(rgb(MUTED)).child(format!(
-                            "{turns} turns{}",
+                            "{} · {turns} turns{}",
+                            agent.label(),
                             agent
                                 .description
                                 .as_ref()
@@ -2483,5 +2540,8 @@ mod tests {
             ]
         );
         assert_eq!(stats.main_model(), Some("claude-opus-5-5"));
+        // Across the run, the $8 of cache writes outweighs $2 of output and $0.20 of reads.
+        assert_eq!(stats.run_cost_driver(&prices), Some(CostDriver::CacheWrite));
+        assert_eq!(stats.token_totals().output, 100_000);
     }
 }
