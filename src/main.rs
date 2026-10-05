@@ -10,9 +10,8 @@ use std::time::{Duration, Instant, SystemTime};
 use chrono::{DateTime, Utc};
 use gpui::{
     anchored, deferred, div, point, prelude::*, px, relative, rgb, size, uniform_list, AnyView,
-    App, Bounds, Context, Decorations, MouseButton, MouseDownEvent,
-    MouseMoveEvent, Pixels, ScrollHandle, SharedString, Size, TitlebarOptions, Window,
-    WindowBounds, WindowOptions,
+    App, Bounds, Context, Decorations, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels,
+    ScrollHandle, SharedString, Size, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 use pricing::{PriceSource, PriceTable, Usage};
@@ -1461,6 +1460,7 @@ impl Render for SessionMonitor {
                 div()
                     .flex()
                     .flex_row()
+                    .flex_none()
                     .gap_3()
                     .flex_wrap()
                     .child(stat_tile(
@@ -1500,6 +1500,9 @@ impl Render for SessionMonitor {
                 div()
                     .flex()
                     .flex_row()
+                    // Sections above the bottom row keep their natural height; a short window
+                    // scrolls rather than squeezing them.
+                    .flex_none()
                     .gap_3()
                     .child(
                         chart_card(
@@ -1808,7 +1811,7 @@ impl SessionMonitor {
             )));
         }
 
-        let mut header = div().flex().flex_col().child(row);
+        let mut header = div().flex().flex_col().flex_none().child(row);
         if self.picker_open {
             header = header.child(
                 deferred(
@@ -2087,7 +2090,7 @@ impl SessionMonitor {
             list = list.child(row);
         }
 
-        chart_card("Costliest turns", subtitle, None, list)
+        chart_card("Costliest turns", subtitle, None, list).flex_none()
     }
 }
 
