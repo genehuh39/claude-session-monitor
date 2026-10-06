@@ -185,8 +185,9 @@ pub fn sync_agents(session: &Path, agents: &mut Vec<AgentRun>) -> bool {
     for agent in agents.iter_mut() {
         // The metadata file can land after the transcript starts.
         if agent.agent_type.is_none() {
+            let before = (agent.agent_type.clone(), agent.description.clone());
             agent.load_meta();
-            changed |= agent.agent_type.is_some();
+            changed |= (&agent.agent_type, &agent.description) != (&before.0, &before.1);
         }
         changed |= agent.tail.poll(&mut agent.stats).unwrap_or(false);
     }
@@ -291,9 +292,19 @@ mod tests {
         fs::write(agents.join("agent-x.jsonl"), "agent\n").unwrap();
         assert!(sync_agents(&session, &mut runs), "a new agent is a change");
         assert!(!sync_agents(&session, &mut runs), "nothing new since");
+        let meta = agents.join("agent-x.meta.json");
+        fs::write(&meta, r#"{"description":"look around"}"#).unwrap();
+        assert!(
+            sync_agents(&session, &mut runs),
+            "a description alone is a change"
+        );
+        assert!(
+            !sync_agents(&session, &mut runs),
+            "rereading the same metadata isn't"
+        );
         fs::write(
-            agents.join("agent-x.meta.json"),
-            r#"{"agentType":"Explore"}"#,
+            &meta,
+            r#"{"agentType":"Explore","description":"look around"}"#,
         )
         .unwrap();
         assert!(
