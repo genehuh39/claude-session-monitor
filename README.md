@@ -38,7 +38,7 @@ The cost tile shows what the session would cost at Claude API list prices (first
 
 ## Requirements
 
-- Rust (stable) and Cargo
+- Rust (stable) and Cargo, installed with [rustup](https://rustup.rs). Afterwards, open a new shell or run `source ~/.cargo/env` so `cargo` is on your `PATH`.
 - macOS or Linux. It has been built and run on macOS, and on Fedora under WSL2 (WSLg).
 - On macOS, the Metal shader toolchain: `xcodebuild -downloadComponent MetalToolchain` (about 700MB, one-time)
 - On Linux, the xkbcommon development headers, plus Wayland, Vulkan and fontconfig libraries. On Fedora: `sudo dnf install libxkbcommon-devel libxkbcommon-x11-devel`
