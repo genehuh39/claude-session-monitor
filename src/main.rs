@@ -393,7 +393,8 @@ impl SessionTail {
         }
     }
 
-    /// Reads any bytes appended since the last read and applies them to `stats`.
+    /// Reads any lines appended since the last read and applies them to `stats`; returns whether
+    /// there were any.
     fn poll(&mut self, stats: &mut Stats) -> anyhow::Result<bool> {
         let mut file = fs::File::open(&self.path)?;
         let len = file.metadata()?.len();
@@ -422,7 +423,7 @@ impl SessionTail {
             };
             self.apply_line(&obj, stats);
         }
-        Ok(true)
+        Ok(complete_len > 0)
     }
 
     fn apply_line(&mut self, obj: &Value, stats: &mut Stats) {
@@ -603,6 +604,16 @@ struct SessionMonitor {
     last_price_fetch: Option<Instant>,
     price_fetch_in_flight: bool,
     price_fetch_error: Option<String>,
+    /// `clock_state()` as of the last redraw the poll timer asked for.
+    drawn_clock: (bool, i64),
+}
+
+/// What one poll of the transcripts found.
+struct Refresh {
+    /// Moved to a different session.
+    switched: bool,
+    /// Anything shown on the dashboard changed.
+    changed: bool,
 }
 
 impl SessionMonitor {
@@ -627,19 +638,27 @@ impl SessionMonitor {
             last_price_fetch: None,
             price_fetch_in_flight: false,
             price_fetch_error: None,
+            drawn_clock: (false, 0),
         };
         this.refresh();
         this.refresh_prices(cx);
 
+        // Poll the transcripts, but only redraw when something on screen would change: drawing
+        // costs far more than polling, especially with software rendering.
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
                 .timer(Duration::from_millis(750))
                 .await;
             let result = this.update(cx, |this, cx| {
-                if this.refresh() {
+                let refresh = this.refresh();
+                if refresh.switched {
                     this.refresh_prices(cx);
                 }
-                cx.notify();
+                let clock = this.clock_state();
+                if refresh.changed || clock != this.drawn_clock || this.picker_open {
+                    this.drawn_clock = clock;
+                    cx.notify();
+                }
             });
             if result.is_err() {
                 return;
@@ -712,17 +731,26 @@ impl SessionMonitor {
         false
     }
 
-    /// Returns whether the active session changed.
-    fn refresh(&mut self) -> bool {
+    fn refresh(&mut self) -> Refresh {
         let switched = self.rescan();
+        let mut changed = switched;
         if let Some(tail) = &mut self.tail {
-            let _ = tail.poll(&mut self.stats);
+            changed |= tail.poll(&mut self.stats).unwrap_or(false);
         }
         if let Some(path) = &self.session_path {
             self.session_modified = sessions::last_activity(path);
-            sessions::sync_agents(path, &mut self.agents);
+            changed |= sessions::sync_agents(path, &mut self.agents);
         }
-        switched
+        Refresh { switched, changed }
+    }
+
+    /// The parts of the dashboard that change with the clock rather than the transcript: the live
+    /// dot and the minute-granularity "ago" labels.
+    fn clock_state(&self) -> (bool, i64) {
+        (
+            sessions::is_live(self.session_modified),
+            Utc::now().timestamp() / 60,
+        )
     }
 
     /// The main session followed by each subagent run.
@@ -2379,6 +2407,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn turn(stats: &mut Stats, model: &str, input: u64) -> TurnPoint {
         TurnPoint {
@@ -2386,6 +2415,23 @@ mod tests {
             model: stats.intern_model(model),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn poll_reports_only_complete_new_lines() {
+        let path = std::env::temp_dir().join(format!("csm-poll-{}.jsonl", std::process::id()));
+        fs::write(&path, "{}\n").unwrap();
+        let mut tail = SessionTail::new(path.clone());
+        let mut stats = Stats::default();
+        assert!(tail.poll(&mut stats).unwrap());
+        assert!(!tail.poll(&mut stats).unwrap(), "nothing appended");
+
+        let mut file = fs::File::options().append(true).open(&path).unwrap();
+        file.write_all(b"{\"type\":").unwrap();
+        assert!(!tail.poll(&mut stats).unwrap(), "only a partial line");
+        file.write_all(b"\"user\"}\n").unwrap();
+        assert!(tail.poll(&mut stats).unwrap());
+        fs::remove_file(&path).unwrap();
     }
 
     #[test]

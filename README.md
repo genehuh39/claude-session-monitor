@@ -19,7 +19,7 @@ Hover any bar for a tooltip with that turn's exact numbers.
 
 ## How it works
 
-Each assistant entry in the transcript carries a `usage` object (`input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`). The app polls the file every 750ms, reads only newly appended complete lines, and aggregates them.
+Each assistant entry in the transcript carries a `usage` object (`input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`). The app polls the file every 750ms, reads only newly appended complete lines, and aggregates them. It redraws only when something on screen changes (new transcript lines, the live dot, or the minute-level "ago" labels), so it uses almost no CPU while the session is idle.
 
 - Claude Code logs each content block of one API message as a separate line with the same message id and usage, so messages are deduplicated by id.
 - Tool latency is the time between a `tool_use` entry and its matching `tool_result`.
