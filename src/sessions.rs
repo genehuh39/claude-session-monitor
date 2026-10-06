@@ -161,13 +161,14 @@ fn subagent_dir(session: &Path) -> PathBuf {
 }
 
 /// Picks up subagent transcripts that appeared since the last call and reads new lines from all
-/// of them.
-pub fn sync_agents(session: &Path, agents: &mut Vec<AgentRun>) {
+/// of them; returns whether anything changed.
+pub fn sync_agents(session: &Path, agents: &mut Vec<AgentRun>) -> bool {
     let mut found: Vec<PathBuf> = subagent_files(session)
         .into_iter()
         .filter(|p| !agents.iter().any(|a| a.tail.path == *p))
         .collect();
     found.sort();
+    let mut changed = !found.is_empty();
     for path in found {
         let id = path
             .file_stem()
@@ -185,9 +186,11 @@ pub fn sync_agents(session: &Path, agents: &mut Vec<AgentRun>) {
         // The metadata file can land after the transcript starts.
         if agent.agent_type.is_none() {
             agent.load_meta();
+            changed |= agent.agent_type.is_some();
         }
-        let _ = agent.tail.poll(&mut agent.stats);
+        changed |= agent.tail.poll(&mut agent.stats).unwrap_or(false);
     }
+    changed
 }
 
 /// A whole session, including its subagents, reduced to what the session picker shows.
@@ -281,8 +284,23 @@ mod tests {
             .unwrap();
         let before = fingerprint(&session);
 
+        let mut runs = Vec::new();
+        assert!(!sync_agents(&session, &mut runs));
+
         // A subagent writing while the main transcript sits idle keeps the session active.
         fs::write(agents.join("agent-x.jsonl"), "agent\n").unwrap();
+        assert!(sync_agents(&session, &mut runs), "a new agent is a change");
+        assert!(!sync_agents(&session, &mut runs), "nothing new since");
+        fs::write(
+            agents.join("agent-x.meta.json"),
+            r#"{"agentType":"Explore"}"#,
+        )
+        .unwrap();
+        assert!(
+            sync_agents(&session, &mut runs),
+            "its type arriving is a change"
+        );
+        assert!(!sync_agents(&session, &mut runs));
         assert!(last_activity(&session).unwrap() > old + Duration::from_secs(300));
         assert!(is_live(last_activity(&session)));
         assert_ne!(fingerprint(&session), before);
