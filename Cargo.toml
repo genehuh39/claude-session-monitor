@@ -2,6 +2,11 @@
 name = "claude-session-monitor"
 version = "0.1.0"
 edition = "2021"
+description = "A native desktop dashboard that charts a live Claude Code session's token usage, cache behavior, cost, and tool calls"
+license = "MIT"
+repository = "https://github.com/genehuh39/claude-session-monitor"
+readme = "README.md"
+publish = false
 
 [dependencies]
 gpui = { git = "https://github.com/zed-industries/zed", rev = "8eb2fd211fcb6dee043382037eaab7a4162eff16" }

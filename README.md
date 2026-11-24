@@ -4,6 +4,10 @@ A native desktop dashboard, built with [GPUI](https://www.gpui.rs/) (the UI fram
 
 It follows the most recently active session transcript under `~/.claude/projects/*/*.jsonl`, so there is nothing to configure and no API key needed. You can also pick a session yourself.
 
+Transcripts are only read locally and nothing is sent anywhere. The app's one network request fetches Anthropic's public pricing page (see [API cost](#api-cost)).
+
+This is an independent project, not affiliated with or endorsed by Anthropic.
+
 ## What it shows
 
 - **Session header:** the project and session id, with a green dot while the session is being written to. Click it to open the session picker, which lists the 10 most recent sessions with their project, last activity and API cost. Picking one pins it; the badge next to the header switches between **FOLLOWING LATEST** and **PINNED**.
@@ -51,9 +55,19 @@ cargo run
 
 The first build compiles GPUI and its dependencies from source and takes a few minutes.
 
+To install the binary onto your `PATH` instead:
+
+```sh
+cargo install --locked --git https://github.com/genehuh39/claude-session-monitor
+```
+
 ## Notes
 
 - `gpui` and `gpui_platform` are pinned to a specific commit of [zed-industries/zed](https://github.com/zed-industries/zed) in `Cargo.toml`, since GPUI's API changes frequently.
 - `gpui_platform` must be built with the `font-kit` feature. Without it, GPUI renders shapes but no text, and only logs a warning.
 - On Linux, `gpui_platform` also needs the `wayland` and `x11` features. Without them GPUI silently runs headless and no window opens.
 - When the compositor doesn't draw window decorations (for example WSLg), the app draws its own title bar for moving, maximizing and closing the window.
+
+## License
+
+[MIT](LICENSE)
