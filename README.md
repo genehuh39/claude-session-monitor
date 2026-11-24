@@ -2,6 +2,8 @@
 
 A native desktop dashboard, built with [GPUI](https://www.gpui.rs/) (the UI framework behind Zed), that watches your Claude Code session live and charts token usage, cache behavior, and tool calls.
 
+![The dashboard following a live session: stat tiles, prompt size and cache hit rate per turn, costliest turns, model, tool mix and recent tool calls](docs/screenshot.png)
+
 It follows the most recently active session transcript under `~/.claude/projects/*/*.jsonl`, so there is nothing to configure and no API key needed. You can also pick a session yourself.
 
 Transcripts are only read locally and nothing is sent anywhere. The app's one network request fetches Anthropic's public pricing page (see [API cost](#api-cost)).
